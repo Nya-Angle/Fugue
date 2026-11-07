@@ -1,0 +1,3165 @@
+import { Palette } from "std-widgets.slint";
+
+// 主题模式：跟随系统 / 深色 / 浅色
+export enum ThemeMode {
+    system,
+    dark,
+    light,
+}
+
+// 块级元素类型
+export enum BlockType {
+    user-bubble,
+    paragraph,
+    heading1,
+    heading2,
+    heading3,
+    thematic-break,
+    blockquote,
+    list-block,
+    table-block,
+    code-block,
+    diagram-block,
+    latex-math,
+    action-capsule,
+    active-tail,
+    active-code-tail,
+}
+
+// 语法高亮 Token
+export struct HighlightToken {
+    text: string,
+    color: color,
+}
+
+// 单行代码 Token 列表（带行号）
+export struct CodeLineData {
+    line-number: int,
+    tokens: [HighlightToken],
+}
+
+// 行内富文本 Span（支持粗体、斜体、行内代码胶囊、删除线、行内公式及公式微图、可点击链接/图片）
+export struct InlineSpanData {
+    text: string,
+    bold: bool,
+    italic: bool,
+    code: bool,
+    strikethrough: bool,
+    math: bool,
+    math-image: image,
+    link-url: string,
+}
+
+// 自动折行后的富文本行
+export struct RichLineData {
+    spans: [InlineSpanData],
+}
+
+// 列表项数据（支持无序/有序列表与 - [ ] / - [x] 任务复选框）
+export struct ListItemData {
+    indent-level: int,
+    marker: string,
+    task-state: int, // 0 = 普通列表项, 1 = 未勾选 [ ], 2 = 已勾选 [x]
+    lines: [RichLineData],
+}
+
+// GFM 表格行数据
+export struct TableRowData {
+    cells: [string],
+}
+
+// Mermaid 图表步骤节点
+export struct DiagramStepData {
+    from-label: string,
+    edge-label: string,
+    to-label: string,
+}
+
+// 会话列表项数据
+export struct SessionItemData {
+    id: string,
+    title: string,
+    preview: string,
+    pinned: bool,
+    archived: bool,
+    active: bool,
+    message-count: int,
+    updated-time-label: string,
+}
+
+// 跨会话 SIMD 高速搜索命中项数据
+export struct SearchHitItemData {
+    session-id: string,
+    session-title: string,
+    message-id: string,
+    message-index: int,
+    snippet: string,
+    role-label: string,
+}
+
+// 扁平化虚拟视口块数据（Fix F9: 移除冗余跨 FFI 的 raw-markdown）
+export struct RenderBlockData {
+    flat-index: int,
+    msg-index: int,
+    block-index: int,
+    id: string,
+    block-type: BlockType,
+    text: string,
+    lang: string,
+    rich-lines: [RichLineData],
+    list-items: [ListItemData],
+    table-headers: [string],
+    table-aligns: [int], // 0 = left, 1 = center, 2 = right (Fix U3)
+    table-rows: [TableRowData],
+    code-lines: [CodeLineData],
+    max-code-cols: int, // 最大字符列宽，驱动横向滚动条 (Fix U5 & M2)
+    diagram-steps: [DiagramStepData],
+    math-image: image,
+    detail-text: string,
+    is-expanded: bool,
+    selected: bool,
+    is-first-in-msg: bool,
+}
+
+// 全局应用状态
+export global AppState {
+    in-out property <ThemeMode> theme-mode: ThemeMode.system;
+    in-out property <string> lang: "zh";
+    in-out property <bool> settings-open: false;
+    in-out property <bool> has-messages: false;
+    in-out property <bool> is-generating: false;
+
+    // 多会话与沙箱侧边栏状态
+    in-out property <bool> sidebar-open: true;
+    in-out property <bool> show-archived-sessions: false;
+    in-out property <string> current-session-id: "";
+    in-out property <string> current-session-title: "新会话";
+    in-out property <string> current-sandbox-path: "";
+    in-out property <string> fugue-root-path: "";
+    in-out property <string> session-search-query: "";
+    in-out property <[SessionItemData]> session-list: [];
+    in-out property <[SearchHitItemData]> search-hits: [];
+
+    // 会话内联重命名状态
+    in-out property <string> renaming-session-id: "";
+    in-out property <string> renaming-session-text: "";
+
+    // 全局唯一静态会话右键菜单状态（O(1) 零重排弹出）
+    in-out property <bool> session-menu-open: false;
+    in-out property <length> session-menu-x: 0px;
+    in-out property <length> session-menu-y: 0px;
+    in-out property <string> session-menu-target-id: "";
+    in-out property <string> session-menu-target-title: "";
+    in-out property <bool> session-menu-target-pinned: false;
+    in-out property <bool> session-menu-target-archived: false;
+
+    // Fenwick 树视口裁剪状态（仅渲染用户能看到的区域）
+    in-out property <length> top-spacer-height: 0px;
+    in-out property <length> bottom-spacer-height: 0px;
+
+    // 智能黏性置底跟随状态（Fix M1）
+    in-out property <bool> auto-scroll-sticky: true;
+
+    // 左键按住拖拽选区状态
+    in-out property <bool> is-drag-selecting: false;
+
+    // 全局唯一静态右键菜单状态（Singleton Context Menu Overlay，O(1) 零重排弹出，Fix F9）
+    in-out property <bool> context-menu-open: false;
+    in-out property <length> context-menu-x: 0px;
+    in-out property <length> context-menu-y: 0px;
+    in-out property <bool> context-menu-is-table: false;
+    in-out property <int> selected-block-count: 0;
+
+    // 回调至 Rust 后端
+    callback send-message(string);
+    callback stop-generation();
+    callback copy-to-clipboard(string);
+    callback copy-block-formatted(int, string); // (flat_index, "markdown" | "tsv" | "plain") (Fix U7 & M8)
+    callback toggle-capsule(int); // flat_index
+    callback theme-changed(bool); // is_dark (Fix L2)
+    callback theme-mode-selected(ThemeMode); // 持久化主题选择
+    callback language-changed(string); // 持久化语言选择 ("zh" | "en")
+    callback viewport-scrolled(float, float, float); // (scroll_y_px, viewport_height_px, viewport_width_px) (Fix M4)
+    callback report-block-height(int, float); // (flat_index, measured_height_px) (Fix L3 & U11)
+    callback block-left-pressed(int, bool, bool); // (flat_index, shift, ctrl)
+    callback block-hover-drag(int); // flat_index while left button held
+    callback block-right-clicked(int, int, bool, float, float); // (flat_index, msg_index, is_table, window_x, window_y)
+    callback context-menu-action(string); // "copy_plain" | "copy_markdown" | "copy_tsv" | "select_block" | "select_message" | "select_all" | "clear_selection"
+
+    // 多会话操作回调
+    callback toggle-sidebar();
+    callback create-new-session();
+    callback select-session(string); // session_id
+    callback clone-session(string); // session_id
+    callback rename-session(string, string); // (session_id, new_title)
+    callback toggle-pin-session(string, bool); // (session_id, new_pinned)
+    callback toggle-archive-session(string, bool); // (session_id, new_archived)
+    callback delete-session(string); // session_id
+    callback switch-archive-tab(bool); // show_archived
+    callback search-sessions-query(string); // query
+    callback jump-to-search-hit(string, string, int); // (session_id, message_id, message_index)
+
+    // 全局 Lenis (duration=1.2, lerp=0.1) 平滑滚动回调
+    callback lenis-wheel-chat(float, float); // (delta_y_px, max_scroll_px)
+    callback lenis-sync-chat(float, float); // (direct_pos_px, max_scroll_px)
+    callback lenis-wheel-sidebar(float, float); // (delta_y_px, max_scroll_px)
+    callback lenis-sync-sidebar(float, float); // (direct_pos_px, max_scroll_px)
+    callback lenis-wheel-input(float, float); // (delta_y_px, max_scroll_px)
+    callback lenis-sync-input(float, float); // (direct_pos_px, max_scroll_px)
+
+    // 中英文文本选择
+    pure public function t(zh: string, en: string) -> string {
+        return lang == "zh" ? zh : en;
+    }
+}
+
+// 全局主题：分层配色
+export global Theme {
+    in-out property <bool> system-dark: Palette.color-scheme == ColorScheme.dark;
+    out property <bool> dark: AppState.theme-mode == ThemeMode.system ? Theme.system-dark : AppState.theme-mode == ThemeMode.dark;
+
+    // 内容区背景：浅色 #FAF9F6 / 深色 #1E1F22
+    out property <brush> content-background: Theme.dark ? #1E1F22 : #FAF9F6;
+    // 标题栏与侧边栏背景：浅色 #F5F4EF / 深色 #212225
+    out property <brush> titlebar-background: Theme.dark ? #212225 : #F5F4EF;
+    out property <brush> sidebar-background: Theme.dark ? #1A1B1E : #F3F1EB;
+
+    // 全局字体：浅色 #2B2926 / 深色 #E8E4D9
+    out property <color> text-color: Theme.dark ? #E8E4D9 : #2B2926;
+    out property <color> muted-text-color: Theme.dark ? #9C9A94 : #7A7873;
+
+    out property <color> hover-background: Theme.dark ? #FFFFFF14 : #00000010;
+    out property <color> border-color: Theme.dark ? #3A3B3F : #DDDAD2;
+    out property <color> accent-color: Theme.dark ? #4C8DFF : #0067C0;
+    out property <color> danger-color: #C42B1C;
+    out property <color> chip-background: Theme.dark ? #292A2E : #EFEDE6;
+    out property <color> selected-chip-background: Theme.dark ? #2C3B57 : #DCE8F7;
+    out property <color> window-border-color: Theme.dark ? #3B3C41 : #D3CFC6;
+
+    // 块选区高亮背景与边框
+    out property <color> selection-bg: Theme.dark ? #4C8DFF24 : #0067C018;
+    out property <color> selection-border: Theme.dark ? #4C8DFF88 : #0067C066;
+
+    // 行内代码胶囊配色
+    out property <color> inline-code-bg: Theme.dark ? #2C2E33 : #EAE7DF;
+    out property <color> inline-code-fg: Theme.dark ? #F0B67F : #B33A2E;
+
+    // 引用块导轨与底色
+    out property <color> quote-bar-color: Theme.dark ? #5A6B8C : #A89F91;
+    out property <color> quote-bg: Theme.dark ? #25262A : #F3F1EA;
+
+    // 表格交替底色
+    out property <color> table-header-bg: Theme.dark ? #26282D : #EAE7DF;
+    out property <color> table-row-even-bg: Theme.dark ? #202125 : #FAF9F6;
+    out property <color> table-row-odd-bg: Theme.dark ? #242529 : #F3F1EA;
+
+    // AI 输入框
+    out property <color> input-border: Theme.dark ? #3D3B36 : #DAD5C7;
+    out property <color> input-border-focus: Theme.dark ? #7C7565 : #B2AA97;
+    out property <brush> input-background: Theme.dark ? #2A2926 : #FFFFFF;
+
+    // 用户消息卡片背景：浅色纯白 / 深色暖炭黑
+    out property <brush> user-card-background: Theme.dark ? #2A2926 : #FFFFFF;
+
+    // AI 回复正文：浅色纯黑 / 深色暖白
+    out property <color> ai-text-color: Theme.dark ? #E8E4D9 : #000000;
+
+    // 代码块背景
+    out property <brush> code-background: Theme.dark ? #18191B : #F2F0E8;
+    out property <brush> code-header-background: Theme.dark ? #212226 : #E9E6DC;
+}
+
+// 标题栏导航按钮
+component NavButton inherits Rectangle {
+    in property <string> text;
+    callback clicked();
+
+    width: label.preferred-width + 20px;
+    height: 28px;
+    border-radius: 4px;
+    background: touch.has-hover ? Theme.hover-background : transparent;
+    animate background { duration: 120ms; }
+
+    label := Text {
+        x: 10px;
+        y: 0;
+        width: parent.width - 20px;
+        height: parent.height;
+        text: root.text;
+        color: Theme.text-color;
+        font-size: 12.5px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// 窗口控制按钮
+component WindowControlButton inherits Rectangle {
+    in property <int> kind: 0;
+    callback clicked();
+
+    width: 46px;
+    height: 40px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+
+    private property <bool> hovered: touch.has-hover;
+    private property <color> button-background: !root.hovered ? Theme.titlebar-background : (root.kind == 3 ? Theme.danger-color : Theme.hover-background);
+    private property <color> icon-color: (root.hovered && root.kind == 3) ? #FFFFFF : Theme.text-color;
+
+    background: root.button-background;
+    animate background { duration: 120ms; }
+
+    touch := TouchArea {
+        mouse-cursor: default;
+        clicked => { root.clicked(); }
+    }
+
+    if (root.kind == 0) : Rectangle {
+        width: 10px;
+        height: 1px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: root.icon-color;
+    }
+
+    if (root.kind == 1) : Rectangle {
+        width: 10px;
+        height: 10px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: transparent;
+        border-width: 1px;
+        border-color: root.icon-color;
+    }
+
+    if (root.kind == 2) : Rectangle {
+        width: 12px;
+        height: 12px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: transparent;
+
+        Rectangle {
+            x: 3px;
+            y: 0px;
+            width: 8px;
+            height: 8px;
+            background: root.button-background;
+            border-width: 1px;
+            border-color: root.icon-color;
+        }
+
+        Rectangle {
+            x: 0px;
+            y: 3px;
+            width: 8px;
+            height: 8px;
+            background: root.button-background;
+            border-width: 1px;
+            border-color: root.icon-color;
+        }
+    }
+
+    if (root.kind == 3) : Path {
+        width: 10px;
+        height: 10px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        stroke: root.icon-color;
+        stroke-width: 1px;
+        fill: transparent;
+
+        MoveTo { x: 0; y: 0; }
+        LineTo { x: 10; y: 10; }
+        MoveTo { x: 10; y: 0; }
+        LineTo { x: 0; y: 10; }
+    }
+}
+
+// 标题栏
+component TitleBar inherits Rectangle {
+    in property <bool> maximized: false;
+
+    callback minimize-clicked();
+    callback maximize-clicked();
+    callback close-clicked();
+
+    height: 40px;
+    background: Theme.titlebar-background;
+
+    WindowMoveArea {
+        TouchArea {
+            double-clicked => { root.maximize-clicked(); }
+        }
+    }
+
+    // 侧边栏折叠/展开按钮
+    sidebar-btn := Rectangle {
+        x: 10px;
+        y: 6px;
+        width: 28px;
+        height: 28px;
+        border-radius: 5px;
+        background: sb-touch.has-hover ? Theme.hover-background : (AppState.sidebar-open ? Theme.selected-chip-background : transparent);
+        animate background { duration: 120ms; }
+
+        Rectangle {
+            width: 14px;
+            height: 12px;
+            x: 7px;
+            y: 8px;
+            border-radius: 2px;
+            border-width: 1.2px;
+            border-color: AppState.sidebar-open ? Theme.accent-color : Theme.text-color;
+            background: transparent;
+
+            Rectangle {
+                x: 4px;
+                y: 0px;
+                width: 1.2px;
+                height: parent.height;
+                background: AppState.sidebar-open ? Theme.accent-color : Theme.text-color;
+            }
+        }
+
+        sb-touch := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { AppState.toggle-sidebar(); }
+        }
+    }
+
+    brand := Text {
+        x: 46px;
+        y: 0;
+        height: parent.height;
+        text: "Fugue";
+        color: Theme.text-color;
+        font-size: 14px;
+        font-weight: 600;
+        vertical-alignment: center;
+    }
+
+    NavButton {
+        x: brand.x + brand.preferred-width + 8px;
+        y: 6px;
+        text: AppState.t("+ 新会话", "+ New");
+        clicked => { AppState.create-new-session(); }
+    }
+
+    NavButton {
+        x: brand.x + brand.preferred-width + 82px;
+        y: 6px;
+        text: AppState.t("设置", "Settings");
+        clicked => { AppState.settings-open = true; }
+    }
+
+    // 当前活跃会话标题居中显示
+    Text {
+        x: (parent.width - self.width) / 2;
+        y: 0;
+        width: max(120px, parent.width - 520px);
+        height: parent.height;
+        text: AppState.current-session-title;
+        color: Theme.muted-text-color;
+        font-size: 12.5px;
+        overflow: elide;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    WindowControlButton {
+        x: parent.width - 138px;
+        y: 0;
+        kind: 0;
+        clicked => { root.minimize-clicked(); }
+    }
+
+    WindowControlButton {
+        x: parent.width - 92px;
+        y: 0;
+        kind: root.maximized ? 2 : 1;
+        clicked => { root.maximize-clicked(); }
+    }
+
+    WindowControlButton {
+        x: parent.width - 46px;
+        y: 0;
+        kind: 3;
+        clicked => { root.close-clicked(); }
+    }
+}
+
+// 设置项胶囊
+component OptionChip inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected: false;
+    callback clicked();
+
+    min-width: 92px;
+    height: 34px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: root.selected ? Theme.accent-color : Theme.border-color;
+    background: root.selected ? Theme.selected-chip-background : Theme.chip-background;
+    animate background, border-color { duration: 150ms; }
+
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        alignment: center;
+
+        Text {
+            text: root.label;
+            color: root.selected ? Theme.text-color : Theme.muted-text-color;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+    }
+
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// 设置面板（Fix X3 & L2: 关闭动画期间 TouchArea 立即禁用不挡底层点击；切换主题/语言立即持久化至 ~/.fugue/config.rkyv）
+component SettingsPanel inherits Rectangle {
+    width: 540px;
+    height: AppState.settings-open ? 410px : 6px;
+    opacity: AppState.settings-open ? 1.0 : 0.0;
+    visible: self.opacity > 0.0;
+
+    animate height { duration: 280ms; easing: ease-in-out; }
+    animate opacity { duration: 280ms; easing: ease-out; }
+
+    border-radius: 10px;
+    clip: true;
+    background: Theme.content-background;
+    border-width: 1px;
+    border-color: Theme.border-color;
+    drop-shadow-color: #00000066;
+    drop-shadow-blur: 28px;
+    drop-shadow-offset-y: 10px;
+
+    TouchArea {
+        enabled: AppState.settings-open;
+    }
+
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: 40px;
+        background: Theme.titlebar-background;
+
+        Text {
+            x: 16px;
+            y: 0;
+            height: parent.height;
+            text: AppState.t("设置", "Settings");
+            color: Theme.text-color;
+            font-size: 13px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+
+        Rectangle {
+            x: parent.width - 40px;
+            y: 8px;
+            width: 24px;
+            height: 24px;
+            border-radius: 4px;
+            background: close-touch.has-hover ? Theme.hover-background : transparent;
+
+            close-touch := TouchArea {
+                enabled: AppState.settings-open;
+                mouse-cursor: pointer;
+                clicked => { AppState.settings-open = false; }
+            }
+
+            Path {
+                width: 10px;
+                height: 10px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                stroke: Theme.text-color;
+                stroke-width: 1px;
+                fill: transparent;
+
+                MoveTo { x: 0; y: 0; }
+                LineTo { x: 10; y: 10; }
+                MoveTo { x: 10; y: 0; }
+                LineTo { x: 0; y: 10; }
+            }
+        }
+    }
+
+    Rectangle {
+        x: 0;
+        y: 40px;
+        width: parent.width;
+        height: max(0px, parent.height - 40px);
+        background: Theme.content-background;
+
+        VerticalLayout {
+            padding: 24px;
+            spacing: 14px;
+
+            Text {
+                text: AppState.t("主题模式", "Theme");
+                color: Theme.text-color;
+                font-size: 14px;
+                font-weight: 600;
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+
+                OptionChip {
+                    label: AppState.t("跟随系统", "System");
+                    selected: AppState.theme-mode == ThemeMode.system;
+                    clicked => {
+                        AppState.theme-mode = ThemeMode.system;
+                        AppState.theme-mode-selected(ThemeMode.system);
+                        AppState.theme-changed(Theme.dark);
+                    }
+                }
+
+                OptionChip {
+                    label: AppState.t("深色", "Dark");
+                    selected: AppState.theme-mode == ThemeMode.dark;
+                    clicked => {
+                        AppState.theme-mode = ThemeMode.dark;
+                        AppState.theme-mode-selected(ThemeMode.dark);
+                        AppState.theme-changed(true);
+                    }
+                }
+
+                OptionChip {
+                    label: AppState.t("浅色", "Light");
+                    selected: AppState.theme-mode == ThemeMode.light;
+                    clicked => {
+                        AppState.theme-mode = ThemeMode.light;
+                        AppState.theme-mode-selected(ThemeMode.light);
+                        AppState.theme-changed(false);
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 1px;
+                background: Theme.border-color;
+            }
+
+            Text {
+                text: AppState.t("语言", "Language");
+                color: Theme.text-color;
+                font-size: 14px;
+                font-weight: 600;
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+
+                OptionChip {
+                    label: "中文";
+                    selected: AppState.lang == "zh";
+                    clicked => {
+                        AppState.lang = "zh";
+                        AppState.language-changed("zh");
+                    }
+                }
+
+                OptionChip {
+                    label: "English";
+                    selected: AppState.lang == "en";
+                    clicked => {
+                        AppState.lang = "en";
+                        AppState.language-changed("en");
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 1px;
+                background: Theme.border-color;
+            }
+
+            Text {
+                text: AppState.t("当前会话物理隔离沙箱", "Current Session Sandbox");
+                color: Theme.text-color;
+                font-size: 13px;
+                font-weight: 600;
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 30px;
+                    border-radius: 5px;
+                    border-width: 1px;
+                    border-color: Theme.border-color;
+                    background: Theme.code-background;
+
+                    Text {
+                        x: 10px;
+                        width: parent.width - 20px;
+                        height: parent.height;
+                        text: AppState.current-sandbox-path;
+                        color: Theme.muted-text-color;
+                        font-family: "JetBrains Mono, Consolas, monospace";
+                        font-size: 11px;
+                        overflow: elide;
+                        vertical-alignment: center;
+                    }
+                }
+
+                OptionChip {
+                    min-width: 72px;
+                    height: 30px;
+                    label: AppState.t("复制路径", "Copy Path");
+                    clicked => {
+                        AppState.copy-to-clipboard(AppState.current-sandbox-path);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// 富文本单行渲染组件（支持 **粗体**、`行内代码`、~~删除线~~、$行内公式微图/Unicode$、可点击链接/图片 Fix U6 & M5）
+component RichLineView inherits HorizontalLayout {
+    in property <[InlineSpanData]> spans;
+    in property <length> base-font-size: 14px;
+    in property <int> base-font-weight: 400;
+    in property <color> base-color: Theme.ai-text-color;
+
+    alignment: start;
+    spacing: 0px;
+
+    for span in root.spans : Rectangle {
+        height: (span.math && span.math-image.width > 0) ? (span.math-image.height * 1px + 4px) : (span-txt.preferred-height + (span.code ? 4px : 0px));
+        width: (span.math && span.math-image.width > 0) ? (span.math-image.width * 1px + 4px) : (span-txt.preferred-width + (span.code ? 10px : 0px));
+        border-radius: span.code ? 4px : 0px;
+        background: span.code ? Theme.inline-code-bg : transparent;
+
+        if (span.math && span.math-image.width > 0) : Image {
+            x: 2px;
+            y: 2px;
+            source: span.math-image;
+        }
+
+        span-txt := Text {
+            visible: !(span.math && span.math-image.width > 0);
+            x: span.code ? 5px : 0px;
+            y: (parent.height - self.preferred-height) / 2;
+            text: span.text;
+            color: span.link-url != "" ? Theme.accent-color : (span.code ? Theme.inline-code-fg : (span.math ? Theme.accent-color : (span.strikethrough ? Theme.muted-text-color : root.base-color)));
+            font-family: span.code ? "JetBrains Mono, Consolas, monospace" : (span.math ? "Cambria Math, Times New Roman, serif" : "");
+            font-size: span.code ? (root.base-font-size - 1px) : root.base-font-size;
+            font-weight: span.bold ? 700 : root.base-font-weight;
+            font-italic: span.italic;
+        }
+
+        // 链接下划线与点击复制 URL（Fix M5）
+        if (span.link-url != "") : Rectangle {
+            x: 0px;
+            y: parent.height - 2px;
+            width: parent.width;
+            height: 1px;
+            background: Theme.accent-color;
+        }
+
+        if (span.link-url != "") : TouchArea {
+            mouse-cursor: pointer;
+            clicked => {
+                AppState.copy-to-clipboard(span.link-url);
+            }
+        }
+
+        // 删除线横贯线（~~Content~~）
+        if (span.strikethrough) : Rectangle {
+            x: 0px;
+            y: parent.height / 2;
+            width: parent.width;
+            height: 1.2px;
+            background: Theme.muted-text-color;
+        }
+    }
+}
+
+// 富文本多行段落视图
+component RichParagraphView inherits VerticalLayout {
+    in property <[RichLineData]> lines;
+    in property <length> font-size: 14px;
+    in property <int> font-weight: 400;
+    in property <color> text-color: Theme.ai-text-color;
+
+    alignment: start;
+    vertical-stretch: 0;
+    spacing: 4px;
+    for line in root.lines : RichLineView {
+        spans: line.spans;
+        base-font-size: root.font-size;
+        base-font-weight: root.font-weight;
+        base-color: root.text-color;
+    }
+}
+
+// 引用块组件（> Content）
+component BlockquoteView inherits Rectangle {
+    in property <[RichLineData]> lines;
+
+    height: quote-layout.preferred-height;
+    vertical-stretch: 0;
+    border-radius: 6px;
+    background: Theme.quote-bg;
+    clip: true;
+
+    quote-layout := HorizontalLayout {
+        spacing: 0px;
+
+        Rectangle {
+            width: 3.5px;
+            background: Theme.quote-bar-color;
+        }
+
+        VerticalLayout {
+            alignment: start;
+            padding: 10px;
+            padding-left: 14px;
+            padding-right: 14px;
+            spacing: 4px;
+
+            RichParagraphView {
+                lines: root.lines;
+                font-size: 14px;
+                text-color: Theme.muted-text-color;
+            }
+        }
+    }
+}
+
+// 列表块与 GFM 任务列表组件（- Content / 1. Content / - [ ] Content / - [x] Content）
+component ListBlockView inherits VerticalLayout {
+    in property <[ListItemData]> items;
+
+    alignment: start;
+    vertical-stretch: 0;
+    spacing: 6px;
+
+    for item in root.items : HorizontalLayout {
+        padding-left: item.indent-level * 18px;
+        spacing: 8px;
+        alignment: start;
+
+        Rectangle {
+            width: 20px;
+            height: 22px;
+
+            if (item.task-state == 0) : Text {
+                width: parent.width;
+                height: parent.height;
+                text: item.marker;
+                color: Theme.accent-color;
+                font-size: 14px;
+                font-weight: 600;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+
+            if (item.task-state == 1) : Rectangle {
+                width: 14px;
+                height: 14px;
+                x: 4px;
+                y: 4px;
+                border-radius: 3px;
+                border-width: 1.5px;
+                border-color: Theme.muted-text-color;
+                background: transparent;
+            }
+
+            if (item.task-state == 2) : Rectangle {
+                width: 14px;
+                height: 14px;
+                x: 4px;
+                y: 4px;
+                border-radius: 3px;
+                background: Theme.accent-color;
+
+                Path {
+                    width: 10px;
+                    height: 10px;
+                    x: 2px;
+                    y: 2px;
+                    stroke: #FFFFFF;
+                    stroke-width: 1.6px;
+                    fill: transparent;
+
+                    MoveTo { x: 1.5; y: 5.0; }
+                    LineTo { x: 4.2; y: 8.0; }
+                    LineTo { x: 8.5; y: 2.0; }
+                }
+            }
+        }
+
+        VerticalLayout {
+            horizontal-stretch: 1;
+            padding-top: 1px;
+            RichParagraphView {
+                lines: item.lines;
+                font-size: 14px;
+                text-color: item.task-state == 2 ? Theme.muted-text-color : Theme.ai-text-color;
+            }
+        }
+    }
+}
+
+// GFM 表格组件（Fix U3, U7, M8: 支持列左/中/右对齐 + 顶部快捷复制 Markdown / TSV 工具条）
+component TableBlockView inherits Rectangle {
+    in property <int> flat-index;
+    in property <[string]> headers;
+    in property <[int]> aligns;
+    in property <[TableRowData]> rows;
+
+    height: table-layout.preferred-height;
+    vertical-stretch: 0;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.border-color;
+    background: Theme.table-row-even-bg;
+    clip: true;
+
+    table-layout := VerticalLayout {
+        alignment: start;
+        spacing: 0px;
+
+        // 顶部表格操作栏（Fix U7 & M8）
+        Rectangle {
+            height: 28px;
+            background: Theme.code-header-background;
+
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 8px;
+                alignment: space-between;
+
+                Text {
+                    text: AppState.t("表格", "Table");
+                    color: Theme.muted-text-color;
+                    font-size: 11px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
+
+                HorizontalLayout {
+                    spacing: 6px;
+
+                    Rectangle {
+                        width: md-lbl.preferred-width + 12px;
+                        height: 20px;
+                        border-radius: 4px;
+                        background: md-touch.has-hover ? Theme.hover-background : transparent;
+                        y: (parent.height - self.height) / 2;
+
+                        md-lbl := Text {
+                            text: AppState.t("复制 Markdown", "Copy MD");
+                            color: Theme.text-color;
+                            font-size: 11px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        md-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                AppState.copy-block-formatted(root.flat-index, "markdown");
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: tsv-lbl.preferred-width + 12px;
+                        height: 20px;
+                        border-radius: 4px;
+                        background: tsv-touch.has-hover ? Theme.hover-background : transparent;
+                        y: (parent.height - self.height) / 2;
+
+                        tsv-lbl := Text {
+                            text: AppState.t("复制 TSV", "Copy TSV");
+                            color: Theme.text-color;
+                            font-size: 11px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        tsv-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                AppState.copy-block-formatted(root.flat-index, "tsv");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            height: 1px;
+            background: Theme.border-color;
+        }
+
+        // 表头行（支持列对齐 Fix U3）
+        Rectangle {
+            background: Theme.table-header-bg;
+            min-height: 34px;
+
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                padding-top: 8px;
+                padding-bottom: 8px;
+                spacing: 12px;
+
+                for h-text[c-idx] in root.headers : Text {
+                    horizontal-stretch: 1;
+                    text: h-text;
+                    color: Theme.text-color;
+                    font-size: 13px;
+                    font-weight: 700;
+                    wrap: word-wrap;
+                    horizontal-alignment: root.aligns[c-idx] == 1 ? center : (root.aligns[c-idx] == 2 ? right : left);
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        Rectangle {
+            height: 1px;
+            background: Theme.border-color;
+        }
+
+        // 数据行（支持列对齐 Fix U3）
+        for row[r-idx] in root.rows : VerticalLayout {
+            spacing: 0px;
+
+            Rectangle {
+                background: Math.mod(r-idx, 2) == 0 ? Theme.table-row-even-bg : Theme.table-row-odd-bg;
+                min-height: 32px;
+
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    padding-top: 6px;
+                    padding-bottom: 6px;
+                    spacing: 12px;
+
+                    for cell-text[c-idx] in row.cells : Text {
+                        horizontal-stretch: 1;
+                        text: cell-text;
+                        color: Theme.text-color;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                        horizontal-alignment: root.aligns[c-idx] == 1 ? center : (root.aligns[c-idx] == 2 ? right : left);
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            if (r-idx + 1 < root.rows.length) : Rectangle {
+                height: 1px;
+                background: Theme.border-color;
+                opacity: 0.5;
+            }
+        }
+    }
+}
+
+// Mermaid / 架构流程图原生矢量渲染组件
+component DiagramBlockView inherits Rectangle {
+    in property <string> title: "Mermaid Diagram";
+    in property <[DiagramStepData]> steps;
+    in property <string> raw-code;
+
+    height: diagram-layout.preferred-height;
+    vertical-stretch: 0;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.border-color;
+    background: Theme.code-background;
+    clip: true;
+
+    diagram-layout := VerticalLayout {
+        alignment: start;
+        Rectangle {
+            height: 30px;
+            background: Theme.code-header-background;
+
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 10px;
+                alignment: space-between;
+
+                Text {
+                    text: "◈ " + root.title;
+                    color: Theme.accent-color;
+                    font-size: 11px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
+
+                Rectangle {
+                    width: copy-txt.preferred-width + 14px;
+                    height: 22px;
+                    border-radius: 4px;
+                    background: copy-area.has-hover ? Theme.hover-background : transparent;
+                    y: (parent.height - self.height) / 2;
+
+                    copy-txt := Text {
+                        text: AppState.t("复制源码", "Copy Source");
+                        color: Theme.muted-text-color;
+                        font-size: 11px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    copy-area := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { AppState.copy-to-clipboard(root.raw-code); }
+                    }
+                }
+            }
+        }
+
+        VerticalLayout {
+            padding: 16px;
+            spacing: 10px;
+
+            for step in root.steps : HorizontalLayout {
+                alignment: center;
+                spacing: 10px;
+
+                Rectangle {
+                    min-width: 110px;
+                    height: 34px;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: Theme.accent-color;
+                    background: Theme.selected-chip-background;
+
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        alignment: center;
+                        Text {
+                            text: step.from-label;
+                            color: Theme.text-color;
+                            font-size: 12px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                if (step.to-label != "") : HorizontalLayout {
+                    spacing: 6px;
+                    alignment: center;
+
+                    if (step.edge-label != "") : Rectangle {
+                        height: 22px;
+                        border-radius: 4px;
+                        background: Theme.chip-background;
+                        y: (parent.height - self.height) / 2;
+                        HorizontalLayout {
+                            padding-left: 6px;
+                            padding-right: 6px;
+                            Text {
+                                text: step.edge-label;
+                                color: Theme.muted-text-color;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "──▶";
+                        color: Theme.accent-color;
+                        font-size: 13px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+
+                    Rectangle {
+                        min-width: 110px;
+                        height: 34px;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: Theme.border-color;
+                        background: Theme.chip-background;
+
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            alignment: center;
+                            Text {
+                                text: step.to-label;
+                                color: Theme.text-color;
+                                font-size: 12px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// 代码块视图（Fix U5, M2, M8: 支持行号显示、自动折行开关、横向 Flickable 与底部横向拖拽滚动条）
+component CodeBlockView inherits Rectangle {
+    in property <string> lang: "text";
+    in property <string> raw-code: "";
+    in property <[CodeLineData]> lines;
+    in property <int> max-cols: 80;
+    in property <bool> is-streaming-tail: false;
+
+    private property <bool> wrap-enabled: false;
+
+    height: code-outer-layout.preferred-height;
+    vertical-stretch: 0;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.border-color;
+    background: Theme.code-background;
+    clip: true;
+
+    code-outer-layout := VerticalLayout {
+        alignment: start;
+        // 顶部工具栏
+        Rectangle {
+            height: 32px;
+            background: Theme.code-header-background;
+
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 8px;
+                alignment: space-between;
+
+                Text {
+                    text: root.lang != "" ? root.lang : "code";
+                    color: Theme.muted-text-color;
+                    font-size: 11px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
+
+                HorizontalLayout {
+                    spacing: 6px;
+
+                    // 自动折行 / 横向滚动切换按钮（Fix M8）
+                    Rectangle {
+                        width: wrap-label.preferred-width + 14px;
+                        height: 22px;
+                        border-radius: 4px;
+                        background: root.wrap-enabled ? Theme.selected-chip-background : (wrap-touch.has-hover ? Theme.hover-background : transparent);
+                        y: (parent.height - self.height) / 2;
+
+                        wrap-label := Text {
+                            text: root.wrap-enabled ? AppState.t("折行: 开", "Wrap: On") : AppState.t("折行: 关", "Wrap: Off");
+                            color: root.wrap-enabled ? Theme.accent-color : Theme.muted-text-color;
+                            font-size: 11px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        wrap-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.wrap-enabled = !root.wrap-enabled; }
+                        }
+                    }
+
+                    // 复制按钮
+                    Rectangle {
+                        width: copy-label.preferred-width + 16px;
+                        height: 22px;
+                        border-radius: 4px;
+                        background: copy-touch.has-hover ? Theme.hover-background : transparent;
+                        y: (parent.height - self.height) / 2;
+
+                        copy-label := Text {
+                            text: AppState.t("复制", "Copy");
+                            color: Theme.text-color;
+                            font-size: 11px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        copy-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                AppState.copy-to-clipboard(root.raw-code);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 代码内容区域
+        if (root.is-streaming-tail || root.wrap-enabled) : Rectangle {
+            VerticalLayout {
+                padding: 12px;
+                spacing: 2px;
+
+                Text {
+                    text: root.raw-code;
+                    color: Theme.text-color;
+                    font-family: "JetBrains Mono, Consolas, monospace";
+                    font-size: 13px;
+                    line-height-factor: 1.3;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        // 横向可滚动高亮代码区（Fix U5 & M2 + Lenis duration=1.2s 横向平滑插值）
+        if (!root.is-streaming-tail && !root.wrap-enabled) : VerticalLayout {
+            spacing: 0px;
+
+            code-flick := Flickable {
+                width: parent.width;
+                height: code-inner-layout.preferred-height;
+                interactive: false;
+                content-width: max(self.width, root.max-cols * 7.8px + 64px);
+                content-height: code-inner-layout.preferred-height;
+
+                animate content-x {
+                    duration: 1200ms;
+                    easing: cubic-bezier(0.16, 1.0, 0.3, 1.0);
+                }
+
+                // 支持 Shift+滚轮 或 触摸板横向 Lenis 惯性滚动
+                TouchArea {
+                    width: parent.content-width;
+                    height: parent.content-height;
+
+                    scroll-event(ev) => {
+                        if (ev.delta-x != 0px) {
+                            code-flick.content-x = min(
+                                0px,
+                                max(min(0px, code-flick.width - code-flick.content-width), code-flick.content-x + ev.delta-x * 1.15)
+                            );
+                            return accept;
+                        }
+                        if (ev.modifiers.shift && ev.delta-y != 0px) {
+                            code-flick.content-x = min(
+                                0px,
+                                max(min(0px, code-flick.width - code-flick.content-width), code-flick.content-x + ev.delta-y * 1.15)
+                            );
+                            return accept;
+                        }
+                        return reject;
+                    }
+                }
+
+                code-inner-layout := VerticalLayout {
+                    padding: 12px;
+                    spacing: 2px;
+
+                    for line in root.lines : HorizontalLayout {
+                        alignment: start;
+                        spacing: 0px;
+
+                        // 行号列（Fix M8）
+                        Text {
+                            width: 32px;
+                            text: line.line-number + "";
+                            color: Theme.muted-text-color;
+                            font-family: "JetBrains Mono, Consolas, monospace";
+                            font-size: 11.5px;
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                            opacity: 0.6;
+                        }
+
+                        Rectangle {
+                            width: 12px;
+                        }
+
+                        for token in line.tokens : Text {
+                            text: token.text;
+                            color: token.color;
+                            font-family: "JetBrains Mono, Consolas, monospace";
+                            font-size: 13px;
+                            line-height-factor: 1.3;
+                        }
+                    }
+                }
+            }
+
+            // 底部横向滚动条（当代码总宽度超出容器宽度时显示，Fix U5 & M2）
+            if (code-flick.content-width > code-flick.width) : h-scroll-track := Rectangle {
+                height: 8px;
+                width: parent.width;
+                background: Theme.code-header-background;
+
+                private property <length> max-h-scroll: max(1px, code-flick.content-width - code-flick.width);
+                private property <length> h-thumb-width: min(
+                    self.width,
+                    max(32px, self.width * ((code-flick.width / 1px) / max(1.0, code-flick.content-width / 1px)))
+                );
+                private property <length> avail-h-track: max(1px, self.width - self.h-thumb-width);
+                private property <float> h-ratio: min(1.0, max(0.0, (-code-flick.content-x / 1px) / (self.max-h-scroll / 1px)));
+
+                Rectangle {
+                    x: parent.h-ratio * parent.avail-h-track;
+                    y: 1px;
+                    width: parent.h-thumb-width;
+                    height: 6px;
+                    border-radius: 3px;
+                    background: h-track-touch.pressed ? Theme.accent-color : (h-track-touch.has-hover ? Theme.muted-text-color : Theme.border-color);
+                }
+
+                h-track-touch := TouchArea {
+                    mouse-cursor: pointer;
+
+                    pointer-event(ev) => {
+                        if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                            let r = min(1.0, max(0.0, ((self.mouse-x - parent.h-thumb-width / 2) / 1px) / (parent.avail-h-track / 1px)));
+                            code-flick.content-x = -r * parent.max-h-scroll;
+                        }
+                    }
+
+                    moved => {
+                        if (self.pressed) {
+                            let r = min(1.0, max(0.0, ((self.mouse-x - parent.h-thumb-width / 2) / 1px) / (parent.avail-h-track / 1px)));
+                            code-flick.content-x = -r * parent.max-h-scroll;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// 内联状态胶囊 / 折叠行
+component ActionCapsuleView inherits Rectangle {
+    in property <string> summary;
+    in property <string> detail-text;
+    in property <bool> is-expanded: false;
+    callback toggle();
+
+    height: capsule-layout.preferred-height;
+    vertical-stretch: 0;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: Theme.border-color;
+    background: Theme.chip-background;
+    clip: true;
+
+    capsule-layout := VerticalLayout {
+        alignment: start;
+        Rectangle {
+            height: 32px;
+
+            capsule-touch := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.toggle(); }
+            }
+
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 8px;
+                alignment: start;
+
+                Text {
+                    text: "⚡";
+                    font-size: 13px;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: root.summary;
+                    color: Theme.text-color;
+                    font-size: 12px;
+                    font-weight: 500;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+
+                Text {
+                    text: root.is-expanded ? "▼" : "▶";
+                    color: Theme.muted-text-color;
+                    font-size: 10px;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        if (root.is-expanded) : Rectangle {
+            background: Theme.code-background;
+            border-width: 1px;
+            border-color: Theme.border-color;
+
+            VerticalLayout {
+                padding: 10px;
+
+                Text {
+                    text: root.detail-text;
+                    color: Theme.muted-text-color;
+                    font-family: "JetBrains Mono, Consolas, monospace";
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+}
+
+// 用户消息卡片
+component UserMessageBubble inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected: false;
+
+    height: bubble-layout.preferred-height;
+    vertical-stretch: 0;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: root.selected ? Theme.accent-color : Theme.border-color;
+    background: root.selected ? Theme.selection-bg : Theme.user-card-background;
+    drop-shadow-color: #00000010;
+    drop-shadow-blur: 8px;
+    drop-shadow-offset-y: 2px;
+
+    bubble-layout := VerticalLayout {
+        alignment: start;
+        padding: 12px;
+        padding-left: 14px;
+        padding-right: 14px;
+
+        Text {
+            text: root.text;
+            color: Theme.text-color;
+            font-size: 14px;
+            line-height-factor: 1.4;
+            wrap: word-wrap;
+            horizontal-alignment: left;
+            vertical-alignment: top;
+        }
+    }
+}
+
+// 单项右键菜单按钮
+component ContextMenuItem inherits Rectangle {
+    in property <string> label;
+    in property <string> shortcut: "";
+    in property <bool> is-danger: false;
+    callback triggered();
+
+    height: 30px;
+    border-radius: 5px;
+    background: item-touch.has-hover ? Theme.hover-background : transparent;
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        alignment: space-between;
+
+        Text {
+            text: root.label;
+            color: root.is-danger ? Theme.danger-color : Theme.text-color;
+            font-size: 12.5px;
+            vertical-alignment: center;
+        }
+
+        if (root.shortcut != "") : Text {
+            text: root.shortcut;
+            color: Theme.muted-text-color;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+    }
+
+    item-touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.triggered(); }
+    }
+}
+
+// 顶层唯一静态消息块右键菜单（Zero-Allocation Singleton Context Menu）
+component SingletonContextMenu inherits Rectangle {
+    in property <length> host-width: 1080px;
+    in property <length> host-height: 720px;
+
+    visible: AppState.context-menu-open;
+    x: min(max(AppState.context-menu-x, 8px), max(8px, root.host-width - self.width - 8px));
+    y: min(max(AppState.context-menu-y, 44px), max(44px, root.host-height - self.height - 8px));
+    width: 220px;
+    height: menu-layout.preferred-height;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.border-color;
+    background: Theme.content-background;
+    drop-shadow-color: #00000055;
+    drop-shadow-blur: 18px;
+    drop-shadow-offset-y: 6px;
+
+    TouchArea { }
+
+    menu-layout := VerticalLayout {
+        padding: 5px;
+        spacing: 2px;
+
+        ContextMenuItem {
+            label: AppState.t("复制为纯文本", "Copy as Plain Text");
+            shortcut: "Ctrl+C";
+            triggered => {
+                AppState.context-menu-open = false;
+                AppState.context-menu-action("copy_plain");
+            }
+        }
+
+        ContextMenuItem {
+            label: AppState.t("复制为 Markdown", "Copy as Markdown");
+            shortcut: "Ctrl+Shift+C";
+            triggered => {
+                AppState.context-menu-open = false;
+                AppState.context-menu-action("copy_markdown");
+            }
+        }
+
+        if (AppState.context-menu-is-table) : ContextMenuItem {
+            label: AppState.t("复制表格为 TSV", "Copy Table as TSV");
+            triggered => {
+                AppState.context-menu-open = false;
+                AppState.context-menu-action("copy_tsv");
+            }
+        }
+
+        Rectangle {
+            height: 1px;
+            background: Theme.border-color;
+        }
+
+        ContextMenuItem {
+            label: AppState.t("选中本块", "Select This Block");
+            triggered => {
+                AppState.context-menu-open = false;
+                AppState.context-menu-action("select_block");
+            }
+        }
+
+        ContextMenuItem {
+            label: AppState.t("选中本条消息", "Select This Message");
+            triggered => {
+                AppState.context-menu-open = false;
+                AppState.context-menu-action("select_message");
+            }
+        }
+
+        ContextMenuItem {
+            label: AppState.t("全选", "Select All");
+            shortcut: "Ctrl+A";
+            triggered => {
+                AppState.context-menu-open = false;
+                AppState.context-menu-action("select_all");
+            }
+        }
+
+        if (AppState.selected-block-count > 0) : ContextMenuItem {
+            label: AppState.t("取消选中", "Clear Selection");
+            shortcut: "Esc";
+            triggered => {
+                AppState.context-menu-open = false;
+                AppState.context-menu-action("clear_selection");
+            }
+        }
+    }
+}
+
+// 顶层唯一静态会话右键菜单（O(1) 零分配弹出：置顶/取消置顶、重命名、克隆独立会话、归档/取消归档、物理删除）
+component SingletonSessionContextMenu inherits Rectangle {
+    in property <length> host-width: 1080px;
+    in property <length> host-height: 720px;
+
+    visible: AppState.session-menu-open;
+    x: min(max(AppState.session-menu-x, 8px), max(8px, root.host-width - self.width - 8px));
+    y: min(max(AppState.session-menu-y, 44px), max(44px, root.host-height - self.height - 8px));
+    width: 196px;
+    height: session-menu-layout.preferred-height;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.border-color;
+    background: Theme.content-background;
+    drop-shadow-color: #00000055;
+    drop-shadow-blur: 18px;
+    drop-shadow-offset-y: 6px;
+
+    TouchArea { }
+
+    session-menu-layout := VerticalLayout {
+        padding: 5px;
+        spacing: 2px;
+
+        ContextMenuItem {
+            label: AppState.session-menu-target-pinned ? AppState.t("取消置顶", "Unpin Session") : AppState.t("置顶会话", "Pin Session");
+            triggered => {
+                AppState.session-menu-open = false;
+                AppState.toggle-pin-session(AppState.session-menu-target-id, !AppState.session-menu-target-pinned);
+            }
+        }
+
+        ContextMenuItem {
+            label: AppState.t("重命名会话", "Rename Session");
+            triggered => {
+                AppState.session-menu-open = false;
+                AppState.renaming-session-id = AppState.session-menu-target-id;
+                AppState.renaming-session-text = AppState.session-menu-target-title;
+            }
+        }
+
+        ContextMenuItem {
+            label: AppState.t("克隆会话 (独立沙箱)", "Clone Session");
+            triggered => {
+                AppState.session-menu-open = false;
+                AppState.clone-session(AppState.session-menu-target-id);
+            }
+        }
+
+        ContextMenuItem {
+            label: AppState.session-menu-target-archived ? AppState.t("取消归档", "Unarchive Session") : AppState.t("归档会话", "Archive Session");
+            triggered => {
+                AppState.session-menu-open = false;
+                AppState.toggle-archive-session(AppState.session-menu-target-id, !AppState.session-menu-target-archived);
+            }
+        }
+
+        Rectangle {
+            height: 1px;
+            background: Theme.border-color;
+        }
+
+        ContextMenuItem {
+            label: AppState.t("删除会话", "Delete Session");
+            is-danger: true;
+            triggered => {
+                AppState.session-menu-open = false;
+                AppState.delete-session(AppState.session-menu-target-id);
+            }
+        }
+    }
+}
+
+// 左侧可折叠多会话沙箱侧边栏（支持 SIMD 实时搜索、活跃/已归档视图、置顶标识、原位重命名、Lenis 平滑滚动）
+component SessionSidebar inherits Rectangle {
+    width: AppState.sidebar-open ? 264px : 0px;
+    animate width { duration: 220ms; easing: ease-out; }
+    clip: true;
+    background: Theme.sidebar-background;
+
+    public function set-scroll-y(pos-px: float) {
+        session-flick.content-y = -pos-px * 1px;
+    }
+
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 264px;
+        height: parent.height;
+
+        VerticalLayout {
+            padding: 10px;
+            spacing: 8px;
+
+            // 顶部：新建会话按钮
+            Rectangle {
+                height: 34px;
+                border-radius: 7px;
+                border-width: 1px;
+                border-color: new-touch.has-hover ? Theme.accent-color : Theme.border-color;
+                background: new-touch.has-hover ? Theme.selected-chip-background : Theme.chip-background;
+                animate background, border-color { duration: 140ms; }
+
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    alignment: space-between;
+
+                    Text {
+                        text: AppState.t("＋ 新建独立沙箱会话", "＋ New Sandbox Session");
+                        color: Theme.text-color;
+                        font-size: 12.5px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+
+                    Text {
+                        text: "Ctrl+N";
+                        color: Theme.muted-text-color;
+                        font-size: 10.5px;
+                        vertical-alignment: center;
+                    }
+                }
+
+                new-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        AppState.renaming-session-id = "";
+                        AppState.create-new-session();
+                    }
+                }
+            }
+
+            // 高速跨会话 SIMD 搜索框
+            Rectangle {
+                height: 32px;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: search-input.has-focus ? Theme.accent-color : Theme.border-color;
+                background: Theme.input-background;
+
+                Text {
+                    x: 10px;
+                    y: 0px;
+                    height: parent.height;
+                    text: "⌕";
+                    color: Theme.muted-text-color;
+                    font-size: 13px;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    x: 28px;
+                    y: 0px;
+                    width: parent.width - 54px;
+                    height: parent.height;
+                    text: AppState.t("跨会话 SIMD 极速检索…", "SIMD search sessions…");
+                    color: Theme.muted-text-color;
+                    font-size: 12px;
+                    visible: search-input.text == "" && search-input.preedit-text == "";
+                    vertical-alignment: center;
+                }
+
+                search-input := TextInput {
+                    x: 28px;
+                    y: 0px;
+                    width: parent.width - (self.text != "" ? 52px : 34px);
+                    height: parent.height;
+                    single-line: true;
+                    font-size: 12px;
+                    color: Theme.text-color;
+                    vertical-alignment: center;
+
+                    changed text => {
+                        AppState.session-search-query = self.text;
+                        AppState.search-sessions-query(self.text);
+                    }
+
+                    key-pressed(ev) => {
+                        if (ev.text == Key.Escape) {
+                            self.text = "";
+                            AppState.session-search-query = "";
+                            AppState.search-sessions-query("");
+                            return accept;
+                        }
+                        return reject;
+                    }
+                }
+
+                if (search-input.text != "") : Rectangle {
+                    x: parent.width - 24px;
+                    y: 6px;
+                    width: 18px;
+                    height: 20px;
+                    border-radius: 4px;
+                    background: clr-touch.has-hover ? Theme.hover-background : transparent;
+
+                    Text {
+                        text: "×";
+                        color: Theme.muted-text-color;
+                        font-size: 13px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    clr-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            search-input.text = "";
+                            AppState.session-search-query = "";
+                            AppState.search-sessions-query("");
+                        }
+                    }
+                }
+            }
+
+            // 活跃 / 已归档 分段切换栏（当未处于搜索状态时显示）
+            if (AppState.session-search-query == "") : HorizontalLayout {
+                height: 28px;
+                spacing: 6px;
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                    border-radius: 5px;
+                    background: !AppState.show-archived-sessions ? Theme.selected-chip-background : Theme.chip-background;
+                    border-width: 1px;
+                    border-color: !AppState.show-archived-sessions ? Theme.accent-color : Theme.border-color;
+
+                    Text {
+                        text: AppState.t("活跃会话", "Active");
+                        color: !AppState.show-archived-sessions ? Theme.text-color : Theme.muted-text-color;
+                        font-size: 11.5px;
+                        font-weight: !AppState.show-archived-sessions ? 600 : 400;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            if (AppState.show-archived-sessions) {
+                                AppState.switch-archive-tab(false);
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                    border-radius: 5px;
+                    background: AppState.show-archived-sessions ? Theme.selected-chip-background : Theme.chip-background;
+                    border-width: 1px;
+                    border-color: AppState.show-archived-sessions ? Theme.accent-color : Theme.border-color;
+
+                    Text {
+                        text: AppState.t("已归档", "Archived");
+                        color: AppState.show-archived-sessions ? Theme.text-color : Theme.muted-text-color;
+                        font-size: 11.5px;
+                        font-weight: AppState.show-archived-sessions ? 600 : 400;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            if (!AppState.show-archived-sessions) {
+                                AppState.switch-archive-tab(true);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 会话列表 / 搜索命中列表滚动视口（由 Lenis duration=1.2, lerp=0.1 平滑驱动）
+            Rectangle {
+                vertical-stretch: 1;
+                clip: true;
+
+                session-flick := Flickable {
+                    width: parent.width;
+                    height: parent.height;
+                    interactive: false;
+                    content-width: self.width;
+                    content-height: max(self.height, session-list-layout.preferred-height);
+
+                    TouchArea {
+                        width: parent.width;
+                        height: max(parent.height, parent.content-height);
+
+                        scroll-event(ev) => {
+                            if (ev.delta-y != 0px && session-flick.content-height > session-flick.height) {
+                                let max-s = (session-flick.content-height - session-flick.height) / 1px;
+                                AppState.lenis-wheel-sidebar(ev.delta-y / 1px, max-s);
+                                return accept;
+                            }
+                            return reject;
+                        }
+                    }
+
+                    session-list-layout := VerticalLayout {
+                        alignment: start;
+                        spacing: 4px;
+                        padding-bottom: 12px;
+
+                        // 模式 1：当用户输入了搜索词，展示跨会话 SIMD 检索命中项
+                        if (AppState.session-search-query != "") : VerticalLayout {
+                            spacing: 4px;
+
+                            if (AppState.search-hits.length == 0) : Rectangle {
+                                height: 64px;
+                                Text {
+                                    text: AppState.t("未找到匹配内容", "No matching content found");
+                                    color: Theme.muted-text-color;
+                                    font-size: 12px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            for hit in AppState.search-hits : hit-card := Rectangle {
+                                height: 60px;
+                                border-radius: 6px;
+                                border-width: 1px;
+                                border-color: hit-touch.has-hover ? Theme.accent-color : Theme.border-color;
+                                background: hit-touch.has-hover ? Theme.hover-background : Theme.chip-background;
+
+                                VerticalLayout {
+                                    padding: 8px;
+                                    spacing: 3px;
+
+                                    HorizontalLayout {
+                                        alignment: space-between;
+                                        Text {
+                                            text: hit.session-title;
+                                            color: Theme.accent-color;
+                                            font-size: 11.5px;
+                                            font-weight: 600;
+                                            overflow: elide;
+                                        }
+                                        Text {
+                                            text: hit.role-label;
+                                            color: Theme.muted-text-color;
+                                            font-size: 10px;
+                                        }
+                                    }
+
+                                    Text {
+                                        text: hit.snippet;
+                                        color: Theme.text-color;
+                                        font-size: 11.5px;
+                                        overflow: elide;
+                                    }
+                                }
+
+                                hit-touch := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        AppState.jump-to-search-hit(hit.session-id, hit.message-id, hit.message-index);
+                                    }
+                                }
+                            }
+                        }
+
+                        // 模式 2：正常展示会话列表
+                        if (AppState.session-search-query == "") : VerticalLayout {
+                            spacing: 4px;
+
+                            if (AppState.session-list.length == 0) : Rectangle {
+                                height: 64px;
+                                Text {
+                                    text: AppState.show-archived-sessions ? AppState.t("暂无已归档会话", "No archived sessions") : AppState.t("暂无会话", "No sessions");
+                                    color: Theme.muted-text-color;
+                                    font-size: 12px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            for item in AppState.session-list : row-rect := Rectangle {
+                                height: 52px;
+                                border-radius: 7px;
+                                border-width: item.active ? 1px : 0px;
+                                border-color: Theme.accent-color;
+                                background: item.active ? Theme.selected-chip-background : (row-touch.has-hover || menu-btn-touch.has-hover ? Theme.hover-background : transparent);
+                                animate background { duration: 110ms; }
+
+                                row-touch := TouchArea {
+                                    mouse-cursor: pointer;
+
+                                    clicked => {
+                                        AppState.session-menu-open = false;
+                                        if (AppState.renaming-session-id != "" && AppState.renaming-session-id != item.id) {
+                                            AppState.renaming-session-id = "";
+                                        }
+                                        AppState.select-session(item.id);
+                                    }
+
+                                    double-clicked => {
+                                        AppState.renaming-session-id = item.id;
+                                        AppState.renaming-session-text = item.title;
+                                    }
+
+                                    pointer-event(ev) => {
+                                        if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
+                                            AppState.context-menu-open = false;
+                                            AppState.session-menu-target-id = item.id;
+                                            AppState.session-menu-target-title = item.title;
+                                            AppState.session-menu-target-pinned = item.pinned;
+                                            AppState.session-menu-target-archived = item.archived;
+                                            AppState.session-menu-x = 12px + self.mouse-x;
+                                            AppState.session-menu-y = 148px + session-flick.content-y + row-rect.y + self.mouse-y;
+                                            AppState.session-menu-open = true;
+                                        }
+                                    }
+                                }
+
+                                // 正常展示状态（非重命名编辑时）
+                                if (AppState.renaming-session-id != item.id) : VerticalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 32px;
+                                    padding-top: 7px;
+                                    padding-bottom: 6px;
+                                    spacing: 3px;
+
+                                    HorizontalLayout {
+                                        spacing: 4px;
+                                        alignment: start;
+
+                                        if (item.pinned) : Text {
+                                            text: "📌";
+                                            font-size: 11px;
+                                            vertical-alignment: center;
+                                        }
+
+                                        Text {
+                                            horizontal-stretch: 1;
+                                            text: item.title;
+                                            color: Theme.text-color;
+                                            font-size: 13px;
+                                            font-weight: item.active ? 600 : 500;
+                                            overflow: elide;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+
+                                    Text {
+                                        text: item.preview != "" ? item.preview : AppState.t("空白沙箱会话", "Empty sandbox session");
+                                        color: Theme.muted-text-color;
+                                        font-size: 11px;
+                                        overflow: elide;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                // 原位内联重命名输入框（Enter 保存，Esc 取消）
+                                if (AppState.renaming-session-id == item.id) : Rectangle {
+                                    x: 8px;
+                                    y: 10px;
+                                    width: parent.width - 16px;
+                                    height: 32px;
+                                    border-radius: 5px;
+                                    border-width: 1px;
+                                    border-color: Theme.accent-color;
+                                    background: Theme.input-background;
+
+                                    rename-input := TextInput {
+                                        x: 8px;
+                                        y: 0px;
+                                        width: parent.width - 16px;
+                                        height: parent.height;
+                                        single-line: true;
+                                        text: AppState.renaming-session-text;
+                                        color: Theme.text-color;
+                                        font-size: 12.5px;
+                                        vertical-alignment: center;
+
+                                        init => {
+                                            self.focus();
+                                            self.select-all();
+                                        }
+
+                                        key-pressed(ev) => {
+                                            if (ev.text == Key.Return) {
+                                                if (self.preedit-text != "") {
+                                                    return reject;
+                                                }
+                                                if (self.text != "") {
+                                                    AppState.rename-session(item.id, self.text);
+                                                }
+                                                AppState.renaming-session-id = "";
+                                                return accept;
+                                            }
+                                            if (ev.text == Key.Escape) {
+                                                AppState.renaming-session-id = "";
+                                                return accept;
+                                            }
+                                            return reject;
+                                        }
+                                    }
+                                }
+
+                                // 右侧悬停快捷三点菜单按钮 `⋯`
+                                Rectangle {
+                                    visible: AppState.renaming-session-id != item.id && (row-touch.has-hover || menu-btn-touch.has-hover || item.active);
+                                    x: parent.width - 28px;
+                                    y: 14px;
+                                    width: 22px;
+                                    height: 22px;
+                                    border-radius: 4px;
+                                    background: menu-btn-touch.has-hover ? Theme.chip-background : transparent;
+
+                                    Text {
+                                        text: "⋯";
+                                        color: Theme.muted-text-color;
+                                        font-size: 13px;
+                                        font-weight: 700;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+
+                                    menu-btn-touch := TouchArea {
+                                        enabled: parent.visible;
+                                        mouse-cursor: pointer;
+                                        clicked => {
+                                            AppState.context-menu-open = false;
+                                            AppState.session-menu-target-id = item.id;
+                                            AppState.session-menu-target-title = item.title;
+                                            AppState.session-menu-target-pinned = item.pinned;
+                                            AppState.session-menu-target-archived = item.archived;
+                                            AppState.session-menu-x = 220px;
+                                            AppState.session-menu-y = 160px + session-flick.content-y + row-rect.y;
+                                            AppState.session-menu-open = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 侧边栏右侧 1px 分割线
+        Rectangle {
+            x: parent.width - 1px;
+            y: 0px;
+            width: 1px;
+            height: parent.height;
+            background: Theme.border-color;
+        }
+    }
+}
+
+// 主界面 AI 输入框（完整交互闭环：点击聚焦、左键拖选文本、Lenis 滚轮与迷你滚动条上下滚动、右键编辑菜单、Shift+Enter 换行、Enter 发送防输入法误触）
+component AiInputBox inherits Rectangle {
+    in property <bool> is-generating: AppState.is-generating;
+    out property <bool> input-focused: input.has-focus;
+    callback right-clicked(length, length);
+
+    forward-focus: input;
+
+    public function focus-input() {
+        input.focus();
+    }
+
+    public function set-scroll-y(pos-px: float) {
+        scroll.content-y = -pos-px * 1px;
+    }
+
+    public function exec-edit-action(act: string) {
+        if (act == "cut") {
+            input.cut();
+        } else if (act == "copy") {
+            input.copy();
+        } else if (act == "paste") {
+            input.paste();
+        } else if (act == "select_all") {
+            input.select-all();
+        } else if (act == "clear") {
+            input.text = "";
+            scroll.content-y = 0px;
+            AppState.lenis-sync-input(0.0, 0.0);
+        }
+        input.focus();
+    }
+
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.input-border-focus : (bg-touch.has-hover ? Theme.muted-text-color : Theme.input-border);
+    background: Theme.input-background;
+    animate border-color { duration: 160ms; }
+
+    bg-touch := TouchArea {
+        mouse-cursor: text;
+        clicked => {
+            AppState.context-menu-open = false;
+            AppState.session-menu-open = false;
+            input.focus();
+        }
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
+                input.focus();
+                root.right-clicked(self.mouse-x, self.mouse-y);
+            }
+        }
+        scroll-event(ev) => {
+            if (ev.delta-y != 0px && scroll.content-height > scroll.height) {
+                let max-s = (scroll.content-height - scroll.height) / 1px;
+                AppState.lenis-wheel-input(ev.delta-y / 1px, max-s);
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    // 占位提示语：输入为空且无输入法预编辑串时显示，聚焦时轻微淡化而不消失
+    Text {
+        x: 18px;
+        y: 16px;
+        width: parent.width - 72px;
+        text: AppState.t("向 Fugue 提问… (Enter 发送，Shift+Enter 换行)", "Ask Fugue anything… (Enter to send, Shift+Enter for newline)");
+        color: Theme.muted-text-color;
+        opacity: input.has-focus ? 0.55 : 0.80;
+        visible: input.text == "" && input.preedit-text == "";
+        animate opacity { duration: 140ms; }
+        font-size: 14px;
+        horizontal-alignment: left;
+        vertical-alignment: top;
+    }
+
+    scroll := Flickable {
+        x: 18px;
+        y: 14px;
+        width: parent.width - 72px;
+        height: parent.height - 28px;
+        interactive: false;
+        content-width: self.width;
+        content-height: max(self.height, input.preferred-height);
+
+        // 底层滚轮与右键拦截层（位于 TextInput 下方，绝不干扰左键点击定位与拖拽选区）
+        TouchArea {
+            width: parent.content-width;
+            height: parent.content-height;
+            mouse-cursor: text;
+
+            clicked => {
+                AppState.context-menu-open = false;
+                AppState.session-menu-open = false;
+                input.focus();
+            }
+
+            pointer-event(ev) => {
+                if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
+                    input.focus();
+                    root.right-clicked(scroll.x + self.mouse-x, scroll.y + scroll.content-y + self.mouse-y);
+                }
+            }
+
+            scroll-event(ev) => {
+                if (ev.delta-y != 0px && scroll.content-height > scroll.height) {
+                    let max-s = (scroll.content-height - scroll.height) / 1px;
+                    AppState.lenis-wheel-input(ev.delta-y / 1px, max-s);
+                    return accept;
+                }
+                return reject;
+            }
+        }
+
+        input := TextInput {
+            width: parent.width;
+            height: max(scroll.height, self.preferred-height);
+            single-line: false;
+            wrap: word-wrap;
+            horizontal-alignment: left;
+            vertical-alignment: top;
+            font-size: 14px;
+            line-height-factor: 1.35;
+            text-cursor-width: 1.5px;
+            page-height: scroll.height;
+            color: Theme.text-color;
+            selection-background-color: Theme.dark ? #4A4842 : #E3DFD4;
+            selection-foreground-color: Theme.text-color;
+
+            changed text => {
+                if (self.text == "") {
+                    scroll.content-y = 0px;
+                    AppState.lenis-sync-input(0.0, 0.0);
+                }
+            }
+
+            // Enter 发送，Shift + Enter 换行（Fix X5: preedit-text 必须为空；空文本或生成中按 Enter 不插入多余换行）
+            key-pressed(event) => {
+                if (event.text == Key.Return) {
+                    if (event.modifiers.shift) {
+                        return reject;
+                    }
+                    if (self.preedit-text != "") {
+                        return reject;
+                    }
+                    if (self.text != "" && !AppState.is-generating) {
+                        AppState.send-message(self.text);
+                        self.text = "";
+                        scroll.content-y = 0px;
+                        AppState.lenis-sync-input(0.0, 0.0);
+                    }
+                    return accept;
+                }
+                return reject;
+            }
+
+            cursor-position-changed(cpos) => {
+                if (cpos.y < -scroll.content-y) {
+                    scroll.content-y = min(0px, -cpos.y);
+                    AppState.lenis-sync-input(-scroll.content-y / 1px, max(0.0, (scroll.content-height - scroll.height) / 1px));
+                } else if (cpos.y > -scroll.content-y + scroll.height - 24px) {
+                    scroll.content-y = min(0px, max(scroll.height - scroll.content-height, -(cpos.y - scroll.height + 24px)));
+                    AppState.lenis-sync-input(-scroll.content-y / 1px, max(0.0, (scroll.content-height - scroll.height) / 1px));
+                }
+            }
+        }
+    }
+
+    // 输入框右侧迷你垂直滚动条（多行文本超出可视高度时显示）
+    if (scroll.content-height > scroll.height) : input-scroll-track := Rectangle {
+        x: parent.width - 50px;
+        y: 14px;
+        width: 5px;
+        height: scroll.height;
+        border-radius: 2.5px;
+        background: input-track-touch.has-hover ? Theme.hover-background : transparent;
+
+        private property <length> max-s: max(1px, scroll.content-height - scroll.height);
+        private property <length> thumb-h: min(
+            self.height,
+            max(18px, self.height * ((scroll.height / 1px) / max(1.0, scroll.content-height / 1px)))
+        );
+        private property <length> avail-t: max(1px, self.height - self.thumb-h);
+        private property <float> s-ratio: min(1.0, max(0.0, (-scroll.content-y / 1px) / (self.max-s / 1px)));
+
+        Rectangle {
+            x: 0.5px;
+            y: parent.s-ratio * parent.avail-t;
+            width: 4px;
+            height: parent.thumb-h;
+            border-radius: 2px;
+            background: input-track-touch.pressed ? Theme.accent-color : Theme.border-color;
+        }
+
+        input-track-touch := TouchArea {
+            mouse-cursor: pointer;
+            pointer-event(ev) => {
+                if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                    let r = min(1.0, max(0.0, ((self.mouse-y - parent.thumb-h / 2) / 1px) / (parent.avail-t / 1px)));
+                    scroll.content-y = -r * parent.max-s;
+                    AppState.lenis-sync-input(-scroll.content-y / 1px, parent.max-s / 1px);
+                }
+            }
+            moved => {
+                if (self.pressed) {
+                    let r = min(1.0, max(0.0, ((self.mouse-y - parent.thumb-h / 2) / 1px) / (parent.avail-t / 1px)));
+                    scroll.content-y = -r * parent.max-s;
+                    AppState.lenis-sync-input(-scroll.content-y / 1px, parent.max-s / 1px);
+                }
+            }
+        }
+    }
+
+    action-btn := Rectangle {
+        x: parent.width - 42px;
+        y: parent.height - 42px;
+        width: 32px;
+        height: 32px;
+        border-radius: 16px;
+        background: root.is-generating ? Theme.danger-color : (input.text != "" ? Theme.accent-color : Theme.hover-background);
+        animate background { duration: 140ms; }
+
+        TouchArea {
+            mouse-cursor: (root.is-generating || input.text != "") ? pointer : default;
+            clicked => {
+                if (root.is-generating) {
+                    AppState.stop-generation();
+                } else if (input.text != "" && input.preedit-text == "") {
+                    AppState.send-message(input.text);
+                    input.text = "";
+                    scroll.content-y = 0px;
+                    AppState.lenis-sync-input(0.0, 0.0);
+                    input.focus();
+                }
+            }
+        }
+
+        if (!root.is-generating) : Path {
+            width: 12px;
+            height: 12px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            stroke: input.text != "" ? #FFFFFF : Theme.muted-text-color;
+            stroke-width: 1.8px;
+            fill: transparent;
+
+            MoveTo { x: 6; y: 12; }
+            LineTo { x: 6; y: 2; }
+            MoveTo { x: 2; y: 6; }
+            LineTo { x: 6; y: 2; }
+            LineTo { x: 10; y: 6; }
+        }
+
+        if (root.is-generating) : Rectangle {
+            width: 10px;
+            height: 10px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #FFFFFF;
+            border-radius: 2px;
+        }
+    }
+}
+
+// 主窗口
+export component MainWindow inherits Window {
+    title: "Fugue";
+    no-frame: true;
+    min-width: 960px;
+    min-height: 600px;
+    preferred-width: 1160px;
+    preferred-height: 740px;
+    background: Theme.content-background;
+    forward-focus: input-box;
+
+    // 暴露经 Fenwick 树视口裁剪后的可见块切片给 Rust 端
+    in-out property <[RenderBlockData]> visible-blocks: [];
+
+    // 输入框专用右键菜单开关与坐标
+    private property <bool> input-menu-open: false;
+    private property <length> input-menu-x: 0px;
+    private property <length> input-menu-y: 0px;
+
+    // 暴露给 Rust Lenis 平滑滚动引擎的坐标驱动接口
+    public function set-chat-scroll-y(pos-px: float) {
+        chat-flick.content-y = -pos-px * 1px;
+    }
+
+    public function set-sidebar-scroll-y(pos-px: float) {
+        sidebar.set-scroll-y(pos-px);
+    }
+
+    public function set-input-scroll-y(pos-px: float) {
+        input-box.set-scroll-y(pos-px);
+    }
+
+    // 暴露给 Rust 端主动调用置底跟随（Fix M1）
+    public function scroll-to-bottom-if-sticky() {
+        if (AppState.auto-scroll-sticky && chat-flick.content-height > chat-flick.height) {
+            let max-s = max(0.0, (chat-flick.content-height - chat-flick.height) / 1px);
+            chat-flick.content-y = min(0px, chat-flick.height - chat-flick.content-height);
+            AppState.lenis-sync-chat(max-s, max-s);
+        }
+    }
+
+    // 顶层键盘作用域作为外层容器（不再覆盖在组件上方抢夺点击焦点）
+    key-handler := FocusScope {
+        width: parent.width;
+        height: parent.height;
+        focus-on-click: false;
+
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                if (root.input-menu-open) {
+                    root.input-menu-open = false;
+                    return accept;
+                }
+                if (AppState.context-menu-open) {
+                    AppState.context-menu-open = false;
+                    return accept;
+                }
+                if (AppState.session-menu-open) {
+                    AppState.session-menu-open = false;
+                    return accept;
+                }
+                if (AppState.renaming-session-id != "") {
+                    AppState.renaming-session-id = "";
+                    return accept;
+                }
+                if (AppState.settings-open) {
+                    AppState.settings-open = false;
+                    return accept;
+                }
+                if (AppState.selected-block-count > 0) {
+                    AppState.context-menu-action("clear_selection");
+                    return accept;
+                }
+            }
+            if (event.modifiers.control && (event.text == "b" || event.text == "B")) {
+                AppState.toggle-sidebar();
+                return accept;
+            }
+            if (event.modifiers.control && (event.text == "n" || event.text == "N")) {
+                AppState.create-new-session();
+                return accept;
+            }
+            if (!input-box.input-focused && event.modifiers.control && (event.text == "c" || event.text == "C")) {
+                if (event.modifiers.shift) {
+                    AppState.context-menu-action("copy_markdown");
+                } else {
+                    AppState.context-menu-action("copy_plain");
+                }
+                return accept;
+            }
+            if (!input-box.input-focused && event.modifiers.control && (event.text == "a" || event.text == "A")) {
+                AppState.context-menu-action("select_all");
+                return accept;
+            }
+            return reject;
+        }
+
+        VerticalLayout {
+            TitleBar {
+                maximized: root.maximized;
+                minimize-clicked => { root.minimized = true; }
+                maximize-clicked => { root.maximized = !root.maximized; }
+                close-clicked => { root.close(); }
+            }
+
+            // 下方主体区：左侧多会话沙箱侧边栏 + 右侧主对话内容区
+            body-row := HorizontalLayout {
+                vertical-stretch: 1;
+                spacing: 0px;
+
+                sidebar := SessionSidebar { }
+
+                // 主内容区域
+                content-rect := Rectangle {
+                    horizontal-stretch: 1;
+                    background: Theme.content-background;
+
+                    // 背景级鼠标点击与释放监听（点击空白区移交焦点至 key-handler 并关闭菜单）
+                    TouchArea {
+                        width: parent.width;
+                        height: parent.height;
+                        pointer-event(ev) => {
+                            if (ev.kind == PointerEventKind.down) {
+                                root.input-menu-open = false;
+                                AppState.context-menu-open = false;
+                                AppState.session-menu-open = false;
+                                key-handler.focus();
+                            } else if (ev.kind == PointerEventKind.up) {
+                                AppState.is-drag-selecting = false;
+                            }
+                        }
+                    }
+
+                    // 对话流视口（居中流 + 禁用左键拖动平移画布 + Lenis duration=1.2, lerp=0.1 平滑滚动）
+                    chat-flick := Flickable {
+                        visible: AppState.has-messages;
+                        x: (parent.width - self.width) / 2;
+                        y: 12px;
+                        width: min(820px, parent.width * 0.78);
+                        height: max(100px, parent.height - input-box.height - 28px);
+                        interactive: false;
+                        // 关键修复：内容高度严格取 chat-layout.preferred-height，绝不用 self.height 拉伸气泡高度！
+                        content-width: self.width;
+                        content-height: chat-layout.preferred-height;
+
+                        changed content-y => {
+                            AppState.viewport-scrolled(-self.content-y / 1px, self.height / 1px, self.width / 1px);
+                        }
+                        changed height => {
+                            AppState.viewport-scrolled(-self.content-y / 1px, self.height / 1px, self.width / 1px);
+                        }
+                        changed width => {
+                            AppState.viewport-scrolled(-self.content-y / 1px, self.height / 1px, self.width / 1px);
+                        }
+                        changed content-height => {
+                            if (AppState.auto-scroll-sticky && self.content-height > self.height) {
+                                let max-s = max(0.0, (self.content-height - self.height) / 1px);
+                                self.content-y = min(0px, self.height - self.content-height);
+                                AppState.lenis-sync-chat(max-s, max-s);
+                            } else if (self.content-height <= self.height) {
+                                self.content-y = 0px;
+                                AppState.lenis-sync-chat(0.0, 0.0);
+                            }
+                        }
+
+                        // 鼠标滚轮 Lenis 平滑滚动支持 + 智能黏性置底切换
+                        TouchArea {
+                            width: parent.width;
+                            height: max(parent.height, parent.content-height);
+
+                            pointer-event(ev) => {
+                                if (ev.kind == PointerEventKind.down) {
+                                    root.input-menu-open = false;
+                                    AppState.context-menu-open = false;
+                                    AppState.session-menu-open = false;
+                                    key-handler.focus();
+                                } else if (ev.kind == PointerEventKind.up) {
+                                    AppState.is-drag-selecting = false;
+                                }
+                            }
+
+                            scroll-event(event) => {
+                                if (event.delta-y != 0px && chat-flick.content-height > chat-flick.height) {
+                                    let max-s = (chat-flick.content-height - chat-flick.height) / 1px;
+                                    AppState.lenis-wheel-chat(event.delta-y / 1px, max-s);
+                                    return accept;
+                                }
+                                return reject;
+                            }
+                        }
+
+                        // Fix L3 & X7: alignment: start + height: self.preferred-height，确保消息少于一屏时绝不拉伸任何子块！
+                        chat-layout := VerticalLayout {
+                            width: parent.width;
+                            height: self.preferred-height;
+                            alignment: start;
+                            spacing: 0px;
+                            padding-bottom: 24px;
+
+                            if (AppState.top-spacer-height > 0px) : Rectangle {
+                                height: AppState.top-spacer-height;
+                                vertical-stretch: 0;
+                                background: transparent;
+                            }
+
+                            for block in root.visible-blocks : block-container := Rectangle {
+                                width: parent.width;
+                                height: block-inner-layout.preferred-height;
+                                vertical-stretch: 0;
+                                border-radius: 6px;
+                                border-width: (block.selected && block.block-type != BlockType.user-bubble) ? 1px : 0px;
+                                border-color: Theme.selection-border;
+                                background: (block.selected && block.block-type != BlockType.user-bubble) ? Theme.selection-bg : transparent;
+
+                                // Fix L3 & U11: 实测高度回填 Fenwick 树
+                                init => {
+                                    if (self.height > 0px) {
+                                        AppState.report-block-height(block.flat-index, self.height / 1px);
+                                    }
+                                }
+                                changed height => {
+                                    if (self.height > 0px) {
+                                        AppState.report-block-height(block.flat-index, self.height / 1px);
+                                    }
+                                }
+
+                                block-touch := TouchArea {
+                                    mouse-cursor: text;
+
+                                    changed has-hover => {
+                                        if (self.has-hover && AppState.is-drag-selecting) {
+                                            AppState.block-hover-drag(block.flat-index);
+                                        }
+                                    }
+
+                                    pointer-event(ev) => {
+                                        if (ev.kind == PointerEventKind.down) {
+                                            root.input-menu-open = false;
+                                            AppState.session-menu-open = false;
+                                            key-handler.focus();
+                                            if (ev.button == PointerEventButton.left) {
+                                                AppState.context-menu-open = false;
+                                                AppState.is-drag-selecting = true;
+                                                AppState.block-left-pressed(
+                                                    block.flat-index,
+                                                    ev.modifiers.shift,
+                                                    ev.modifiers.control
+                                                );
+                                            } else if (ev.button == PointerEventButton.right) {
+                                                AppState.is-drag-selecting = false;
+                                                AppState.block-right-clicked(
+                                                    block.flat-index,
+                                                    block.msg-index,
+                                                    block.block-type == BlockType.table-block,
+                                                    (sidebar.width + chat-flick.x + block-container.x + self.mouse-x) / 1px,
+                                                    (40px + chat-flick.y + chat-flick.content-y + block-container.y + self.mouse-y) / 1px
+                                                );
+                                            }
+                                        } else if (ev.kind == PointerEventKind.up || ev.kind == PointerEventKind.cancel) {
+                                            AppState.is-drag-selecting = false;
+                                        }
+                                    }
+
+                                    moved => {
+                                        if (AppState.is-drag-selecting && self.pressed) {
+                                            AppState.block-hover-drag(block.flat-index);
+                                            // Fix M6: 拖拽选区靠近视口上下边缘（36px）时自动步进滚屏
+                                            let mouse-in-flick-y = chat-flick.content-y + block-container.y + self.mouse-y;
+                                            let min-cy = min(0px, chat-flick.height - chat-flick.content-height);
+                                            let max-s = max(0.0, -min-cy / 1px);
+                                            if (mouse-in-flick-y < 36px && chat-flick.content-y < 0px) {
+                                                AppState.auto-scroll-sticky = false;
+                                                chat-flick.content-y = min(0px, chat-flick.content-y + 18px);
+                                                AppState.lenis-sync-chat(-chat-flick.content-y / 1px, max-s);
+                                            } else if (mouse-in-flick-y > chat-flick.height - 36px && chat-flick.content-y > min-cy) {
+                                                chat-flick.content-y = max(min-cy, chat-flick.content-y - 18px);
+                                                AppState.lenis-sync-chat(-chat-flick.content-y / 1px, max-s);
+                                            }
+                                        } else if (!self.pressed && AppState.is-drag-selecting) {
+                                            AppState.is-drag-selecting = false;
+                                        }
+                                    }
+                                }
+
+                                block-inner-layout := VerticalLayout {
+                                    alignment: start;
+                                    padding-top: block.is-first-in-msg ? 8px : 2px;
+                                    padding-bottom: 10px;
+                                    padding-left: 6px;
+                                    padding-right: 6px;
+
+                                    if (block.block-type == BlockType.user-bubble) : HorizontalLayout {
+                                        alignment: end;
+                                        vertical-stretch: 0;
+                                        UserMessageBubble {
+                                            text: block.text;
+                                            selected: block.selected;
+                                            max-width: 520px;
+                                        }
+                                    }
+
+                                    if (block.block-type == BlockType.paragraph) : RichParagraphView {
+                                        lines: block.rich-lines;
+                                        font-size: 14px;
+                                    }
+
+                                    if (block.block-type == BlockType.heading1) : RichParagraphView {
+                                        lines: block.rich-lines;
+                                        font-size: 20px;
+                                        font-weight: 700;
+                                    }
+
+                                    if (block.block-type == BlockType.heading2) : RichParagraphView {
+                                        lines: block.rich-lines;
+                                        font-size: 17px;
+                                        font-weight: 600;
+                                    }
+
+                                    if (block.block-type == BlockType.heading3) : RichParagraphView {
+                                        lines: block.rich-lines;
+                                        font-size: 15px;
+                                        font-weight: 600;
+                                    }
+
+                                    if (block.block-type == BlockType.thematic-break) : Rectangle {
+                                        height: 14px;
+                                        vertical-stretch: 0;
+                                        background: transparent;
+                                        Rectangle {
+                                            y: 6.5px;
+                                            width: parent.width;
+                                            height: 1px;
+                                            background: Theme.border-color;
+                                        }
+                                    }
+
+                                    if (block.block-type == BlockType.blockquote) : BlockquoteView {
+                                        lines: block.rich-lines;
+                                    }
+
+                                    if (block.block-type == BlockType.list-block) : ListBlockView {
+                                        items: block.list-items;
+                                    }
+
+                                    if (block.block-type == BlockType.table-block) : TableBlockView {
+                                        flat-index: block.flat-index;
+                                        headers: block.table-headers;
+                                        aligns: block.table-aligns;
+                                        rows: block.table-rows;
+                                    }
+
+                                    if (block.block-type == BlockType.code-block) : CodeBlockView {
+                                        lang: block.lang;
+                                        raw-code: block.text;
+                                        lines: block.code-lines;
+                                        max-cols: block.max-code-cols;
+                                        is-streaming-tail: false;
+                                    }
+
+                                    if (block.block-type == BlockType.active-code-tail) : CodeBlockView {
+                                        lang: block.lang;
+                                        raw-code: block.text;
+                                        lines: [];
+                                        max-cols: block.max-code-cols;
+                                        is-streaming-tail: true;
+                                    }
+
+                                    if (block.block-type == BlockType.diagram-block) : DiagramBlockView {
+                                        title: block.lang;
+                                        steps: block.diagram-steps;
+                                        raw-code: block.text;
+                                    }
+
+                                    if (block.block-type == BlockType.latex-math) : Rectangle {
+                                        background: transparent;
+                                        height: max(36px, math-row.preferred-height);
+                                        vertical-stretch: 0;
+                                        math-row := HorizontalLayout {
+                                            alignment: center;
+                                            padding-top: 6px;
+                                            padding-bottom: 6px;
+                                            if (block.math-image.width > 0) : Image {
+                                                source: block.math-image;
+                                            }
+                                            if (block.math-image.width == 0) : Text {
+                                                text: block.text;
+                                                color: Theme.accent-color;
+                                                font-family: "Cambria Math, Times New Roman, serif";
+                                                font-size: 15px;
+                                                font-italic: true;
+                                            }
+                                        }
+                                    }
+
+                                    if (block.block-type == BlockType.action-capsule) : ActionCapsuleView {
+                                        summary: block.text;
+                                        detail-text: block.detail-text;
+                                        is-expanded: block.is-expanded;
+                                        toggle => {
+                                            AppState.toggle-capsule(block.flat-index);
+                                        }
+                                    }
+
+                                    if (block.block-type == BlockType.active-tail) : RichParagraphView {
+                                        lines: block.rich-lines;
+                                        font-size: 14px;
+                                    }
+                                }
+                            }
+
+                            if (AppState.bottom-spacer-height > 0px) : Rectangle {
+                                height: AppState.bottom-spacer-height;
+                                vertical-stretch: 0;
+                                background: transparent;
+                            }
+                        }
+                    }
+
+                    // 右侧独立高性能滚动条
+                    scrollbar-track := Rectangle {
+                        visible: AppState.has-messages && chat-flick.content-height > chat-flick.height;
+                        x: parent.width - 12px;
+                        y: chat-flick.y;
+                        width: 8px;
+                        height: chat-flick.height;
+                        border-radius: 4px;
+                        background: track-touch.has-hover ? Theme.hover-background : transparent;
+
+                        private property <length> max-scroll: max(1px, chat-flick.content-height - chat-flick.height);
+                        private property <length> thumb-height: min(
+                            chat-flick.height,
+                            max(
+                                28px,
+                                chat-flick.height * ((chat-flick.height / 1px) / max(1.0, chat-flick.content-height / 1px))
+                            )
+                        );
+                        private property <length> available-track: max(1px, self.height - self.thumb-height);
+                        private property <float> scroll-ratio: min(1.0, max(0.0, (-chat-flick.content-y / 1px) / (self.max-scroll / 1px)));
+
+                        Rectangle {
+                            x: 1px;
+                            y: parent.scroll-ratio * parent.available-track;
+                            width: 6px;
+                            height: parent.thumb-height;
+                            border-radius: 3px;
+                            background: track-touch.pressed ? Theme.accent-color : (track-touch.has-hover ? Theme.muted-text-color : Theme.border-color);
+                        }
+
+                        track-touch := TouchArea {
+                            mouse-cursor: pointer;
+
+                            pointer-event(ev) => {
+                                if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                                    let ratio = min(1.0, max(0.0, ((self.mouse-y - parent.thumb-height / 2) / 1px) / (parent.available-track / 1px)));
+                                    let next-cy = -ratio * parent.max-scroll;
+                                    chat-flick.content-y = next-cy;
+                                    AppState.lenis-sync-chat(-next-cy / 1px, parent.max-scroll / 1px);
+                                    AppState.auto-scroll-sticky = ratio >= 0.96;
+                                } else if (ev.kind == PointerEventKind.up) {
+                                    AppState.is-drag-selecting = false;
+                                }
+                            }
+
+                            moved => {
+                                if (self.pressed) {
+                                    let ratio = min(1.0, max(0.0, ((self.mouse-y - parent.thumb-height / 2) / 1px) / (parent.available-track / 1px)));
+                                    let next-cy = -ratio * parent.max-scroll;
+                                    chat-flick.content-y = next-cy;
+                                    AppState.lenis-sync-chat(-next-cy / 1px, parent.max-scroll / 1px);
+                                    AppState.auto-scroll-sticky = ratio >= 0.96;
+                                }
+                            }
+                        }
+                    }
+
+                    // 空状态欢迎标语
+                    if (!AppState.has-messages) : Rectangle {
+                        x: (parent.width - self.width) / 2;
+                        y: input-box.y - self.height - 24px;
+                        width: min(520px, parent.width * 0.65);
+                        height: 80px;
+
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 8px;
+
+                            Text {
+                                text: "Fugue Omni";
+                                color: Theme.text-color;
+                                font-size: 24px;
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                            }
+
+                            Text {
+                                text: AppState.t("极致性能 · 独立沙箱多会话 · 唯一门面", "Extreme Performance · Sandboxed Multi-Session · Sole Omni Facade");
+                                color: Theme.muted-text-color;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                            }
+                        }
+                    }
+
+                    // AI 输入框
+                    input-box := AiInputBox {
+                        width: min(820px, parent.width * 0.76);
+                        height: min(130px, parent.height * 0.18);
+                        x: (parent.width - self.width) / 2;
+                        y: AppState.has-messages ? (parent.height - self.height - 12px) : ((parent.height - self.height) / 2 + 10px);
+                        animate y { duration: 320ms; easing: ease-out; }
+
+                        right-clicked(rel-x, rel-y) => {
+                            AppState.context-menu-open = false;
+                            AppState.session-menu-open = false;
+                            root.input-menu-x = sidebar.width + self.x + rel-x;
+                            root.input-menu-y = 40px + self.y + rel-y;
+                            root.input-menu-open = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 右键菜单开启时的全屏透明点击关闭层
+    if (AppState.context-menu-open || AppState.session-menu-open || root.input-menu-open) : TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down) {
+                AppState.context-menu-open = false;
+                AppState.session-menu-open = false;
+                root.input-menu-open = false;
+            }
+        }
+    }
+
+    // 消息块全局唯一静态右键菜单实例
+    SingletonContextMenu {
+        host-width: root.width;
+        host-height: root.height;
+    }
+
+    // 会话列表全局唯一静态右键菜单实例
+    SingletonSessionContextMenu {
+        host-width: root.width;
+        host-height: root.height;
+    }
+
+    // 输入框专用右键编辑菜单（剪切 / 复制 / 粘贴 / 全选 / 清空）
+    if (root.input-menu-open) : Rectangle {
+        x: min(max(root.input-menu-x, 8px), max(8px, root.width - self.width - 8px));
+        y: min(max(root.input-menu-y, 44px), max(44px, root.height - self.height - 8px));
+        width: 188px;
+        height: input-menu-layout.preferred-height;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.border-color;
+        background: Theme.content-background;
+        drop-shadow-color: #00000055;
+        drop-shadow-blur: 18px;
+        drop-shadow-offset-y: 6px;
+
+        TouchArea { }
+
+        input-menu-layout := VerticalLayout {
+            padding: 5px;
+            spacing: 2px;
+
+            ContextMenuItem {
+                label: AppState.t("粘贴", "Paste");
+                shortcut: "Ctrl+V";
+                triggered => {
+                    root.input-menu-open = false;
+                    input-box.exec-edit-action("paste");
+                }
+            }
+
+            ContextMenuItem {
+                label: AppState.t("复制", "Copy");
+                shortcut: "Ctrl+C";
+                triggered => {
+                    root.input-menu-open = false;
+                    input-box.exec-edit-action("copy");
+                }
+            }
+
+            ContextMenuItem {
+                label: AppState.t("剪切", "Cut");
+                shortcut: "Ctrl+X";
+                triggered => {
+                    root.input-menu-open = false;
+                    input-box.exec-edit-action("cut");
+                }
+            }
+
+            Rectangle {
+                height: 1px;
+                background: Theme.border-color;
+            }
+
+            ContextMenuItem {
+                label: AppState.t("全选", "Select All");
+                shortcut: "Ctrl+A";
+                triggered => {
+                    root.input-menu-open = false;
+                    input-box.exec-edit-action("select_all");
+                }
+            }
+
+            ContextMenuItem {
+                label: AppState.t("清空输入框", "Clear Input");
+                triggered => {
+                    root.input-menu-open = false;
+                    input-box.exec-edit-action("clear");
+                }
+            }
+        }
+    }
+
+    // 设置面板遮罩（Fix X3: enabled 绑定 AppState.settings-open，关闭动画期间绝不拦截底层点击）
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: #000000;
+        opacity: AppState.settings-open ? (Theme.dark ? 0.55 : 0.35) : 0.0;
+        visible: self.opacity > 0.0;
+        animate opacity { duration: 280ms; easing: ease-out; }
+
+        TouchArea {
+            enabled: AppState.settings-open;
+            clicked => { AppState.settings-open = false; }
+        }
+    }
+
+    SettingsPanel {
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+    }
+
+    // 1px 窗口外轮廓
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: transparent;
+        border-width: 1px;
+        border-color: Theme.window-border-color;
+    }
+}
