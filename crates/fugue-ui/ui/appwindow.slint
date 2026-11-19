@@ -47,12 +47,21 @@ export struct InlineSpanData {
     strikethrough: bool,
     math: bool,
     math-image: image,
+    image-source: image,
     link-url: string,
 }
 
 // 自动折行后的富文本行
 export struct RichLineData {
     spans: [InlineSpanData],
+}
+
+// 字符级选区高亮矩形（块内局部坐标）
+export struct SelectionRectData {
+    x: length,
+    y: length,
+    width: length,
+    height: length,
 }
 
 // 列表项数据（支持无序/有序列表与 - [ ] / - [x] 任务复选框）
@@ -118,6 +127,7 @@ export struct RenderBlockData {
     detail-text: string,
     is-expanded: bool,
     selected: bool,
+    selection-rects: [SelectionRectData],
     is-first-in-msg: bool,
 }
 
@@ -133,7 +143,7 @@ export global AppState {
     in-out property <bool> sidebar-open: true;
     in-out property <bool> show-archived-sessions: false;
     in-out property <string> current-session-id: "";
-    in-out property <string> current-session-title: "新会话";
+    in-out property <string> current-session-title: "";
     in-out property <string> current-sandbox-path: "";
     in-out property <string> fugue-root-path: "";
     in-out property <string> session-search-query: "";
@@ -181,10 +191,15 @@ export global AppState {
     callback language-changed(string); // 持久化语言选择 ("zh" | "en")
     callback viewport-scrolled(float, float, float); // (scroll_y_px, viewport_height_px, viewport_width_px) (Fix M4)
     callback report-block-height(int, float); // (flat_index, measured_height_px) (Fix L3 & U11)
-    callback block-left-pressed(int, bool, bool); // (flat_index, shift, ctrl)
-    callback block-hover-drag(int); // flat_index while left button held
-    callback block-right-clicked(int, int, bool, float, float); // (flat_index, msg_index, is_table, window_x, window_y)
+    callback chat-pointer-down(float, float, int, bool, bool); // (viewport_x, viewport_y, button: 0=left,1=right, shift, ctrl)
+    callback chat-pointer-move(float, float, bool); // (viewport_x, viewport_y, pressed)
+    callback chat-pointer-up(float, float, int); // (viewport_x, viewport_y, button: 0=left,1=right)
+    callback selection-auto-scroll-tick(float); // (viewport_y)
     callback context-menu-action(string); // "copy_plain" | "copy_markdown" | "copy_tsv" | "select_block" | "select_message" | "select_all" | "clear_selection"
+    callback code-block-scrolled(int, float); // (flat_index, scroll_x_px)
+    callback code-wrap-changed(int, bool); // (flat_index, wrap_enabled)
+    callback open-external-url(string); // safe http/https URL
+    callback toggle-task-checkbox(int, int); // (flat_index, item_index)
 
     // 多会话操作回调
     callback toggle-sidebar();
@@ -239,7 +254,7 @@ export global Theme {
     out property <color> window-border-color: Theme.dark ? #3B3C41 : #D3CFC6;
 
     // 块选区高亮背景与边框
-    out property <color> selection-bg: Theme.dark ? #4C8DFF24 : #0067C018;
+    out property <color> selection-bg: Theme.dark ? #4C8DFF44 : #0067C030;
     out property <color> selection-border: Theme.dark ? #4C8DFF88 : #0067C066;
 
     // 行内代码胶囊配色
@@ -259,6 +274,9 @@ export global Theme {
     out property <color> input-border: Theme.dark ? #3D3B36 : #DAD5C7;
     out property <color> input-border-focus: Theme.dark ? #7C7565 : #B2AA97;
     out property <brush> input-background: Theme.dark ? #2A2926 : #FFFFFF;
+    out property <color> input-selection-bg: Theme.dark ? #4A4842 : #E3DFD4;
+    out property <color> menu-shadow: #00000055;
+    out property <color> on-accent-fg: #FFFFFF;
 
     // 用户消息卡片背景：浅色纯白 / 深色暖炭黑
     out property <brush> user-card-background: Theme.dark ? #2A2926 : #FFFFFF;
@@ -401,64 +419,66 @@ component TitleBar inherits Rectangle {
         }
     }
 
-    // 侧边栏折叠/展开按钮
-    sidebar-btn := Rectangle {
+    HorizontalLayout {
         x: 10px;
-        y: 6px;
-        width: 28px;
-        height: 28px;
-        border-radius: 5px;
-        background: sb-touch.has-hover ? Theme.hover-background : (AppState.sidebar-open ? Theme.selected-chip-background : transparent);
-        animate background { duration: 120ms; }
+        y: 0px;
+        height: parent.height;
+        spacing: 8px;
+        alignment: start;
 
-        Rectangle {
-            width: 14px;
-            height: 12px;
-            x: 7px;
-            y: 8px;
-            border-radius: 2px;
-            border-width: 1.2px;
-            border-color: AppState.sidebar-open ? Theme.accent-color : Theme.text-color;
-            background: transparent;
+        // 侧边栏折叠/展开按钮
+        sidebar-btn := Rectangle {
+            y: 6px;
+            width: 28px;
+            height: 28px;
+            border-radius: 5px;
+            background: sb-touch.has-hover ? Theme.hover-background : (AppState.sidebar-open ? Theme.selected-chip-background : transparent);
+            animate background { duration: 120ms; }
 
             Rectangle {
-                x: 4px;
-                y: 0px;
-                width: 1.2px;
-                height: parent.height;
-                background: AppState.sidebar-open ? Theme.accent-color : Theme.text-color;
+                width: 14px;
+                height: 12px;
+                x: 7px;
+                y: 8px;
+                border-radius: 2px;
+                border-width: 1.2px;
+                border-color: AppState.sidebar-open ? Theme.accent-color : Theme.text-color;
+                background: transparent;
+
+                Rectangle {
+                    x: 4px;
+                    y: 0px;
+                    width: 1.2px;
+                    height: parent.height;
+                    background: AppState.sidebar-open ? Theme.accent-color : Theme.text-color;
+                }
+            }
+
+            sb-touch := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { AppState.toggle-sidebar(); }
             }
         }
 
-        sb-touch := TouchArea {
-            mouse-cursor: pointer;
-            clicked => { AppState.toggle-sidebar(); }
+        brand := Text {
+            text: "Fugue";
+            color: Theme.text-color;
+            font-size: 14px;
+            font-weight: 600;
+            vertical-alignment: center;
         }
-    }
 
-    brand := Text {
-        x: 46px;
-        y: 0;
-        height: parent.height;
-        text: "Fugue";
-        color: Theme.text-color;
-        font-size: 14px;
-        font-weight: 600;
-        vertical-alignment: center;
-    }
+        NavButton {
+            y: 6px;
+            text: AppState.t("+ 新会话", "+ New");
+            clicked => { AppState.create-new-session(); }
+        }
 
-    NavButton {
-        x: brand.x + brand.preferred-width + 8px;
-        y: 6px;
-        text: AppState.t("+ 新会话", "+ New");
-        clicked => { AppState.create-new-session(); }
-    }
-
-    NavButton {
-        x: brand.x + brand.preferred-width + 82px;
-        y: 6px;
-        text: AppState.t("设置", "Settings");
-        clicked => { AppState.settings-open = true; }
+        NavButton {
+            y: 6px;
+            text: AppState.t("设置", "Settings");
+            clicked => { AppState.settings-open = true; }
+        }
     }
 
     // 当前活跃会话标题居中显示
@@ -467,7 +487,7 @@ component TitleBar inherits Rectangle {
         y: 0;
         width: max(120px, parent.width - 520px);
         height: parent.height;
-        text: AppState.current-session-title;
+        text: AppState.current-session-title != "" ? AppState.current-session-title : AppState.t("新会话", "New Chat");
         color: Theme.muted-text-color;
         font-size: 12.5px;
         overflow: elide;
@@ -501,6 +521,7 @@ component TitleBar inherits Rectangle {
 component OptionChip inherits Rectangle {
     in property <string> label;
     in property <bool> selected: false;
+    in property <bool> chip-enabled: true;
     callback clicked();
 
     min-width: 92px;
@@ -524,8 +545,9 @@ component OptionChip inherits Rectangle {
         }
     }
 
-    TouchArea {
-        mouse-cursor: pointer;
+    chip-touch := TouchArea {
+        enabled: root.chip-enabled;
+        mouse-cursor: root.chip-enabled ? pointer : default;
         clicked => { root.clicked(); }
     }
 }
@@ -626,6 +648,7 @@ component SettingsPanel inherits Rectangle {
                 OptionChip {
                     label: AppState.t("跟随系统", "System");
                     selected: AppState.theme-mode == ThemeMode.system;
+                    chip-enabled: AppState.settings-open;
                     clicked => {
                         AppState.theme-mode = ThemeMode.system;
                         AppState.theme-mode-selected(ThemeMode.system);
@@ -636,6 +659,7 @@ component SettingsPanel inherits Rectangle {
                 OptionChip {
                     label: AppState.t("深色", "Dark");
                     selected: AppState.theme-mode == ThemeMode.dark;
+                    chip-enabled: AppState.settings-open;
                     clicked => {
                         AppState.theme-mode = ThemeMode.dark;
                         AppState.theme-mode-selected(ThemeMode.dark);
@@ -646,6 +670,7 @@ component SettingsPanel inherits Rectangle {
                 OptionChip {
                     label: AppState.t("浅色", "Light");
                     selected: AppState.theme-mode == ThemeMode.light;
+                    chip-enabled: AppState.settings-open;
                     clicked => {
                         AppState.theme-mode = ThemeMode.light;
                         AppState.theme-mode-selected(ThemeMode.light);
@@ -672,6 +697,7 @@ component SettingsPanel inherits Rectangle {
                 OptionChip {
                     label: "中文";
                     selected: AppState.lang == "zh";
+                    chip-enabled: AppState.settings-open;
                     clicked => {
                         AppState.lang = "zh";
                         AppState.language-changed("zh");
@@ -681,6 +707,7 @@ component SettingsPanel inherits Rectangle {
                 OptionChip {
                     label: "English";
                     selected: AppState.lang == "en";
+                    chip-enabled: AppState.settings-open;
                     clicked => {
                         AppState.lang = "en";
                         AppState.language-changed("en");
@@ -748,24 +775,34 @@ component RichLineView inherits HorizontalLayout {
     spacing: 0px;
 
     for span in root.spans : Rectangle {
-        height: (span.math && span.math-image.width > 0) ? (span.math-image.height * 1px + 4px) : (span-txt.preferred-height + (span.code ? 4px : 0px));
-        width: (span.math && span.math-image.width > 0) ? (span.math-image.width * 1px + 4px) : (span-txt.preferred-width + (span.code ? 10px : 0px));
-        border-radius: span.code ? 4px : 0px;
+        height: (span.image-source.width > 0) ? (min(220px, span.image-source.height * 1px) + 6px) : ((span.math && span.math-image.width > 0) ? (span.math-image.height * 1px + 4px) : (span-txt.preferred-height + (span.code ? 4px : 0px)));
+        width: (span.image-source.width > 0) ? (min(360px, span.image-source.width * 1px) + 6px) : ((span.math && span.math-image.width > 0) ? (span.math-image.width * 1px + 4px) : (span-txt.preferred-width + (span.code ? 10px : 0px)));
+        border-radius: span.code ? 4px : (span.image-source.width > 0 ? 6px : 0px);
         background: span.code ? Theme.inline-code-bg : transparent;
+        clip: span.image-source.width > 0;
 
-        if (span.math && span.math-image.width > 0) : Image {
+        if (span.image-source.width > 0) : Image {
+            x: 3px;
+            y: 3px;
+            width: parent.width - 6px;
+            height: parent.height - 6px;
+            source: span.image-source;
+            image-fit: contain;
+        }
+
+        if (span.math && span.math-image.width > 0 && span.image-source.width == 0) : Image {
             x: 2px;
             y: 2px;
             source: span.math-image;
         }
 
         span-txt := Text {
-            visible: !(span.math && span.math-image.width > 0);
+            visible: !(span.math && span.math-image.width > 0) && span.image-source.width == 0;
             x: span.code ? 5px : 0px;
             y: (parent.height - self.preferred-height) / 2;
             text: span.text;
             color: span.link-url != "" ? Theme.accent-color : (span.code ? Theme.inline-code-fg : (span.math ? Theme.accent-color : (span.strikethrough ? Theme.muted-text-color : root.base-color)));
-            font-family: span.code ? "JetBrains Mono, Consolas, monospace" : (span.math ? "Cambria Math, Times New Roman, serif" : "");
+            font-family: span.code ? "JetBrains Mono, Consolas, monospace" : (span.math ? "Cambria Math, Times New Roman, serif" : "Segoe UI");
             font-size: span.code ? (root.base-font-size - 1px) : root.base-font-size;
             font-weight: span.bold ? 700 : root.base-font-weight;
             font-italic: span.italic;
@@ -782,8 +819,13 @@ component RichLineView inherits HorizontalLayout {
 
         if (span.link-url != "") : TouchArea {
             mouse-cursor: pointer;
+            pointer-event(ev) => {
+                if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
+                    AppState.copy-to-clipboard(span.link-url);
+                }
+            }
             clicked => {
-                AppState.copy-to-clipboard(span.link-url);
+                AppState.open-external-url(span.link-url);
             }
         }
 
@@ -852,13 +894,14 @@ component BlockquoteView inherits Rectangle {
 
 // 列表块与 GFM 任务列表组件（- Content / 1. Content / - [ ] Content / - [x] Content）
 component ListBlockView inherits VerticalLayout {
+    in property <int> flat-index: -1;
     in property <[ListItemData]> items;
 
     alignment: start;
     vertical-stretch: 0;
     spacing: 6px;
 
-    for item in root.items : HorizontalLayout {
+    for item[item-idx] in root.items : HorizontalLayout {
         padding-left: item.indent-level * 18px;
         spacing: 8px;
         alignment: start;
@@ -866,6 +909,15 @@ component ListBlockView inherits VerticalLayout {
         Rectangle {
             width: 20px;
             height: 22px;
+
+            if (item.task-state == 1 || item.task-state == 2) : TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    if (root.flat-index >= 0) {
+                        AppState.toggle-task-checkbox(root.flat-index, item-idx);
+                    }
+                }
+            }
 
             if (item.task-state == 0) : Text {
                 width: parent.width;
@@ -1087,7 +1139,7 @@ component TableBlockView inherits Rectangle {
 
 // Mermaid / 架构流程图原生矢量渲染组件
 component DiagramBlockView inherits Rectangle {
-    in property <string> title: "Mermaid Diagram";
+    in property <string> title: "";
     in property <[DiagramStepData]> steps;
     in property <string> raw-code;
 
@@ -1111,7 +1163,7 @@ component DiagramBlockView inherits Rectangle {
                 alignment: space-between;
 
                 Text {
-                    text: "◈ " + root.title;
+                    text: "◈ " + (root.title != "" ? root.title : AppState.t("Mermaid 流程图", "Mermaid Diagram"));
                     color: Theme.accent-color;
                     font-size: 11px;
                     font-weight: 600;
@@ -1229,11 +1281,14 @@ component DiagramBlockView inherits Rectangle {
 
 // 代码块视图（Fix U5, M2, M8: 支持行号显示、自动折行开关、横向 Flickable 与底部横向拖拽滚动条）
 component CodeBlockView inherits Rectangle {
+    in property <int> flat-index: -1;
     in property <string> lang: "text";
     in property <string> raw-code: "";
     in property <[CodeLineData]> lines;
     in property <int> max-cols: 80;
     in property <bool> is-streaming-tail: false;
+    in property <length> chat-flick-abs-x: 0px;
+    in property <length> chat-flick-abs-y: 0px;
 
     private property <bool> wrap-enabled: false;
 
@@ -1258,7 +1313,7 @@ component CodeBlockView inherits Rectangle {
                 alignment: space-between;
 
                 Text {
-                    text: root.lang != "" ? root.lang : "code";
+                    text: root.lang != "" ? root.lang : AppState.t("代码", "code");
                     color: Theme.muted-text-color;
                     font-size: 11px;
                     font-weight: 600;
@@ -1286,7 +1341,12 @@ component CodeBlockView inherits Rectangle {
 
                         wrap-touch := TouchArea {
                             mouse-cursor: pointer;
-                            clicked => { root.wrap-enabled = !root.wrap-enabled; }
+                            clicked => {
+                                root.wrap-enabled = !root.wrap-enabled;
+                                if (root.flat-index >= 0) {
+                                    AppState.code-wrap-changed(root.flat-index, root.wrap-enabled);
+                                }
+                            }
                         }
                     }
 
@@ -1342,18 +1402,57 @@ component CodeBlockView inherits Rectangle {
                 width: parent.width;
                 height: code-inner-layout.preferred-height;
                 interactive: false;
-                content-width: max(self.width, root.max-cols * 7.8px + 64px);
+                content-width: max(self.width, code-inner-layout.preferred-width);
                 content-height: code-inner-layout.preferred-height;
+
+                changed content-x => {
+                    if (root.flat-index >= 0) {
+                        AppState.code-block-scrolled(root.flat-index, -self.content-x / 1px);
+                    }
+                }
 
                 animate content-x {
                     duration: 1200ms;
                     easing: cubic-bezier(0.16, 1.0, 0.3, 1.0);
                 }
 
-                // 支持 Shift+滚轮 或 触摸板横向 Lenis 惯性滚动
-                TouchArea {
+                // 支持 Shift+滚轮 或 触摸板横向 Lenis 惯性滚动，同时透传指针划词与右键菜单事件
+                code-touch := TouchArea {
                     width: parent.content-width;
                     height: parent.content-height;
+                    mouse-cursor: text;
+
+                    pointer-event(ev) => {
+                        let vx = (self.absolute-position.x - root.chat-flick-abs-x + self.mouse-x) / 1px;
+                        let vy = (self.absolute-position.y - root.chat-flick-abs-y + self.mouse-y) / 1px;
+                        if (ev.kind == PointerEventKind.down) {
+                            AppState.session-menu-open = false;
+                            if (ev.button == PointerEventButton.left) {
+                                AppState.context-menu-open = false;
+                                AppState.is-drag-selecting = true;
+                                AppState.chat-pointer-down(vx, vy, 0, ev.modifiers.shift, ev.modifiers.control);
+                            } else if (ev.button == PointerEventButton.right) {
+                                AppState.is-drag-selecting = false;
+                                AppState.context-menu-x = (self.absolute-position.x + self.mouse-x) / 1px * 1px;
+                                AppState.context-menu-y = (self.absolute-position.y + self.mouse-y) / 1px * 1px;
+                                AppState.chat-pointer-down(vx, vy, 1, ev.modifiers.shift, ev.modifiers.control);
+                            }
+                        } else if (ev.kind == PointerEventKind.up || ev.kind == PointerEventKind.cancel) {
+                            let btn = ev.button == PointerEventButton.right ? 1 : 0;
+                            AppState.is-drag-selecting = false;
+                            AppState.chat-pointer-up(vx, vy, btn);
+                        }
+                    }
+
+                    moved => {
+                        if (AppState.is-drag-selecting && self.pressed) {
+                            let vx = (self.absolute-position.x - root.chat-flick-abs-x + self.mouse-x) / 1px;
+                            let vy = (self.absolute-position.y - root.chat-flick-abs-y + self.mouse-y) / 1px;
+                            AppState.chat-pointer-move(vx, vy, true);
+                        } else if (!self.pressed && AppState.is-drag-selecting) {
+                            AppState.is-drag-selecting = false;
+                        }
+                    }
 
                     scroll-event(ev) => {
                         if (ev.delta-x != 0px) {
@@ -1459,6 +1558,8 @@ component ActionCapsuleView inherits Rectangle {
     in property <string> summary;
     in property <string> detail-text;
     in property <bool> is-expanded: false;
+    in property <length> chat-flick-abs-x: 0px;
+    in property <length> chat-flick-abs-y: 0px;
     callback toggle();
 
     height: capsule-layout.preferred-height;
@@ -1476,6 +1577,20 @@ component ActionCapsuleView inherits Rectangle {
 
             capsule-touch := TouchArea {
                 mouse-cursor: pointer;
+                pointer-event(ev) => {
+                    if (ev.button == PointerEventButton.right) {
+                        let vx = (self.absolute-position.x - root.chat-flick-abs-x + self.mouse-x) / 1px;
+                        let vy = (self.absolute-position.y - root.chat-flick-abs-y + self.mouse-y) / 1px;
+                        if (ev.kind == PointerEventKind.down) {
+                            AppState.is-drag-selecting = false;
+                            AppState.context-menu-x = (self.absolute-position.x + self.mouse-x) / 1px * 1px;
+                            AppState.context-menu-y = (self.absolute-position.y + self.mouse-y) / 1px * 1px;
+                            AppState.chat-pointer-down(vx, vy, 1, ev.modifiers.shift, ev.modifiers.control);
+                        } else if (ev.kind == PointerEventKind.up || ev.kind == PointerEventKind.cancel) {
+                            AppState.chat-pointer-up(vx, vy, 1);
+                        }
+                    }
+                }
                 clicked => { root.toggle(); }
             }
 
@@ -1533,14 +1648,15 @@ component ActionCapsuleView inherits Rectangle {
 // 用户消息卡片
 component UserMessageBubble inherits Rectangle {
     in property <string> text;
+    in property <[RichLineData]> rich-lines: [];
     in property <bool> selected: false;
 
     height: bubble-layout.preferred-height;
     vertical-stretch: 0;
     border-radius: 12px;
     border-width: 1px;
-    border-color: root.selected ? Theme.accent-color : Theme.border-color;
-    background: root.selected ? Theme.selection-bg : Theme.user-card-background;
+    border-color: Theme.border-color;
+    background: Theme.user-card-background;
     drop-shadow-color: #00000010;
     drop-shadow-blur: 8px;
     drop-shadow-offset-y: 2px;
@@ -1551,7 +1667,14 @@ component UserMessageBubble inherits Rectangle {
         padding-left: 14px;
         padding-right: 14px;
 
-        Text {
+        if (root.rich-lines.length > 0) : RichParagraphView {
+            lines: root.rich-lines;
+            font-size: 14px;
+            font-weight: 400;
+            text-color: Theme.text-color;
+        }
+
+        if (root.rich-lines.length == 0) : Text {
             text: root.text;
             color: Theme.text-color;
             font-size: 14px;
@@ -1568,11 +1691,12 @@ component ContextMenuItem inherits Rectangle {
     in property <string> label;
     in property <string> shortcut: "";
     in property <bool> is-danger: false;
+    in property <bool> item-enabled: true;
     callback triggered();
 
     height: 30px;
     border-radius: 5px;
-    background: item-touch.has-hover ? Theme.hover-background : transparent;
+    background: (root.item-enabled && item-touch.has-hover) ? Theme.hover-background : transparent;
 
     HorizontalLayout {
         padding-left: 10px;
@@ -1581,7 +1705,8 @@ component ContextMenuItem inherits Rectangle {
 
         Text {
             text: root.label;
-            color: root.is-danger ? Theme.danger-color : Theme.text-color;
+            color: !root.item-enabled ? Theme.muted-text-color : (root.is-danger ? Theme.danger-color : Theme.text-color);
+            opacity: root.item-enabled ? 1.0 : 0.45;
             font-size: 12.5px;
             vertical-alignment: center;
         }
@@ -1589,13 +1714,15 @@ component ContextMenuItem inherits Rectangle {
         if (root.shortcut != "") : Text {
             text: root.shortcut;
             color: Theme.muted-text-color;
+            opacity: root.item-enabled ? 1.0 : 0.45;
             font-size: 11px;
             vertical-alignment: center;
         }
     }
 
     item-touch := TouchArea {
-        mouse-cursor: pointer;
+        enabled: root.item-enabled;
+        mouse-cursor: root.item-enabled ? pointer : default;
         clicked => { root.triggered(); }
     }
 }
@@ -1870,12 +1997,15 @@ component SessionSidebar inherits Rectangle {
                     }
 
                     key-pressed(ev) => {
-                        if (ev.text == Key.Escape) {
-                            self.text = "";
-                            AppState.session-search-query = "";
-                            AppState.search-sessions-query("");
-                            return accept;
-                        }
+            if (ev.text == Key.Escape) {
+                self.text = "";
+                AppState.session-search-query = "";
+                AppState.search-sessions-query("");
+                AppState.context-menu-open = false;
+                AppState.session-menu-open = false;
+                AppState.settings-open = false;
+                return accept;
+            }
                         return reject;
                     }
                 }
@@ -1976,6 +2106,18 @@ component SessionSidebar inherits Rectangle {
                     interactive: false;
                     content-width: self.width;
                     content-height: max(self.height, session-list-layout.preferred-height);
+
+                    changed content-height => {
+                        let max-s = max(0.0, (self.content-height - self.height) / 1px);
+                        if (self.content-height <= self.height) {
+                            self.content-y = 0px;
+                            AppState.lenis-sync-sidebar(0.0, 0.0);
+                        } else {
+                            let cur-y = max(0.0, min(max-s, -self.content-y / 1px));
+                            self.content-y = -cur-y * 1px;
+                            AppState.lenis-sync-sidebar(cur-y, max-s);
+                        }
+                    }
 
                     TouchArea {
                         width: parent.width;
@@ -2101,8 +2243,8 @@ component SessionSidebar inherits Rectangle {
                                             AppState.session-menu-target-title = item.title;
                                             AppState.session-menu-target-pinned = item.pinned;
                                             AppState.session-menu-target-archived = item.archived;
-                                            AppState.session-menu-x = 12px + self.mouse-x;
-                                            AppState.session-menu-y = 148px + session-flick.content-y + row-rect.y + self.mouse-y;
+                                            AppState.session-menu-x = (self.absolute-position.x + self.mouse-x) / 1px * 1px;
+                                            AppState.session-menu-y = (self.absolute-position.y + self.mouse-y) / 1px * 1px;
                                             AppState.session-menu-open = true;
                                         }
                                     }
@@ -2186,6 +2328,9 @@ component SessionSidebar inherits Rectangle {
                                             }
                                             if (ev.text == Key.Escape) {
                                                 AppState.renaming-session-id = "";
+                                                AppState.context-menu-open = false;
+                                                AppState.session-menu-open = false;
+                                                AppState.settings-open = false;
                                                 return accept;
                                             }
                                             return reject;
@@ -2221,8 +2366,8 @@ component SessionSidebar inherits Rectangle {
                                             AppState.session-menu-target-title = item.title;
                                             AppState.session-menu-target-pinned = item.pinned;
                                             AppState.session-menu-target-archived = item.archived;
-                                            AppState.session-menu-x = 220px;
-                                            AppState.session-menu-y = 160px + session-flick.content-y + row-rect.y;
+                                            AppState.session-menu-x = (self.absolute-position.x - 160px) / 1px * 1px;
+                                            AppState.session-menu-y = (self.absolute-position.y + 22px) / 1px * 1px;
                                             AppState.session-menu-open = true;
                                         }
                                     }
@@ -2259,6 +2404,12 @@ component AiInputBox inherits Rectangle {
 
     public function set-scroll-y(pos-px: float) {
         scroll.content-y = -pos-px * 1px;
+    }
+
+    public function clear-text() {
+        input.text = "";
+        scroll.content-y = 0px;
+        AppState.lenis-sync-input(0.0, 0.0);
     }
 
     public function exec-edit-action(act: string) {
@@ -2372,13 +2523,19 @@ component AiInputBox inherits Rectangle {
             text-cursor-width: 1.5px;
             page-height: scroll.height;
             color: Theme.text-color;
-            selection-background-color: Theme.dark ? #4A4842 : #E3DFD4;
+            selection-background-color: Theme.input-selection-bg;
             selection-foreground-color: Theme.text-color;
 
             changed text => {
                 if (self.text == "") {
                     scroll.content-y = 0px;
                     AppState.lenis-sync-input(0.0, 0.0);
+                } else {
+                    let min-y = min(0px, scroll.height - max(scroll.height, self.preferred-height));
+                    if (scroll.content-y < min-y) {
+                        scroll.content-y = min-y;
+                        AppState.lenis-sync-input(-scroll.content-y / 1px, max(0.0, (scroll.content-height - scroll.height) / 1px));
+                    }
                 }
             }
 
@@ -2553,11 +2710,21 @@ export component MainWindow inherits Window {
         input-box.set-scroll-y(pos-px);
     }
 
+    public function clear-input-text() {
+        input-box.clear-text();
+    }
+
+    public function focus-chat-scope() {
+        key-handler.focus();
+    }
+
     // 暴露给 Rust 端主动调用置底跟随（Fix M1）
     public function scroll-to-bottom-if-sticky() {
         if (AppState.auto-scroll-sticky && chat-flick.content-height > chat-flick.height) {
             let max-s = max(0.0, (chat-flick.content-height - chat-flick.height) / 1px);
+            root.suppress-viewport-callback = true;
             chat-flick.content-y = min(0px, chat-flick.height - chat-flick.content-height);
+            root.suppress-viewport-callback = false;
             AppState.lenis-sync-chat(max-s, max-s);
         }
     }
@@ -2680,26 +2847,64 @@ export component MainWindow inherits Window {
                         changed content-height => {
                             if (AppState.auto-scroll-sticky && self.content-height > self.height) {
                                 let max-s = max(0.0, (self.content-height - self.height) / 1px);
+                                root.suppress-viewport-callback = true;
                                 self.content-y = min(0px, self.height - self.content-height);
+                                root.suppress-viewport-callback = false;
                                 AppState.lenis-sync-chat(max-s, max-s);
                             } else if (self.content-height <= self.height) {
+                                root.suppress-viewport-callback = true;
                                 self.content-y = 0px;
+                                root.suppress-viewport-callback = false;
                                 AppState.lenis-sync-chat(0.0, 0.0);
                             }
                         }
 
-                        // 鼠标滚轮 Lenis 平滑滚动支持 + 智能黏性置底切换
-                        TouchArea {
-                            width: parent.width;
-                            height: max(parent.height, parent.content-height);
+                        // 全局单层 Chrome 级划词 TouchArea（固定对齐可视视口，彻底消除跨块 pointer grab 冲突）
+                        chat-selection-touch := TouchArea {
+                            x: 0px;
+                            y: -chat-flick.content-y;
+                            width: chat-flick.width;
+                            height: chat-flick.height;
+                            mouse-cursor: text;
 
                             pointer-event(ev) => {
                                 if (ev.kind == PointerEventKind.down) {
                                     root.input-menu-open = false;
-                                    AppState.context-menu-open = false;
                                     AppState.session-menu-open = false;
                                     key-handler.focus();
-                                } else if (ev.kind == PointerEventKind.up) {
+                                    if (ev.button == PointerEventButton.left) {
+                                        AppState.context-menu-open = false;
+                                        AppState.is-drag-selecting = true;
+                                        AppState.chat-pointer-down(
+                                            self.mouse-x / 1px,
+                                            self.mouse-y / 1px,
+                                            0,
+                                            ev.modifiers.shift,
+                                            ev.modifiers.control
+                                        );
+                                    } else if (ev.button == PointerEventButton.right) {
+                                        AppState.is-drag-selecting = false;
+                                        AppState.context-menu-x = (sidebar.width + chat-flick.x + self.mouse-x) / 1px * 1px;
+                                        AppState.context-menu-y = (40px + chat-flick.y + self.mouse-y) / 1px * 1px;
+                                        AppState.chat-pointer-down(
+                                            self.mouse-x / 1px,
+                                            self.mouse-y / 1px,
+                                            1,
+                                            ev.modifiers.shift,
+                                            ev.modifiers.control
+                                        );
+                                    }
+                                } else if (ev.kind == PointerEventKind.up || ev.kind == PointerEventKind.cancel) {
+                                    let btn = ev.button == PointerEventButton.right ? 1 : 0;
+                                    AppState.is-drag-selecting = false;
+                                    AppState.chat-pointer-up(self.mouse-x / 1px, self.mouse-y / 1px, btn);
+                                }
+                            }
+
+                            moved => {
+                                if (AppState.is-drag-selecting && self.pressed) {
+                                    AppState.chat-pointer-move(self.mouse-x / 1px, self.mouse-y / 1px, true);
+                                } else if (!self.pressed && AppState.is-drag-selecting) {
                                     AppState.is-drag-selecting = false;
                                 }
                             }
@@ -2711,6 +2916,15 @@ export component MainWindow inherits Window {
                                     return accept;
                                 }
                                 return reject;
+                            }
+                        }
+
+                        // 16ms 边缘自动滚屏定时器：鼠标停留在视口上下边缘不动也能持续平滑滚屏并延伸选区
+                        Timer {
+                            interval: 16ms;
+                            running: AppState.is-drag-selecting;
+                            triggered => {
+                                AppState.selection-auto-scroll-tick(chat-selection-touch.mouse-y / 1px);
                             }
                         }
 
@@ -2733,9 +2947,7 @@ export component MainWindow inherits Window {
                                 height: block-inner-layout.preferred-height;
                                 vertical-stretch: 0;
                                 border-radius: 6px;
-                                border-width: (block.selected && block.block-type != BlockType.user-bubble) ? 1px : 0px;
-                                border-color: Theme.selection-border;
-                                background: (block.selected && block.block-type != BlockType.user-bubble) ? Theme.selection-bg : transparent;
+                                background: transparent;
 
                                 // Fix L3 & U11: 实测高度回填 Fenwick 树
                                 init => {
@@ -2746,64 +2958,6 @@ export component MainWindow inherits Window {
                                 changed height => {
                                     if (self.height > 0px) {
                                         AppState.report-block-height(block.flat-index, self.height / 1px);
-                                    }
-                                }
-
-                                block-touch := TouchArea {
-                                    mouse-cursor: text;
-
-                                    changed has-hover => {
-                                        if (self.has-hover && AppState.is-drag-selecting) {
-                                            AppState.block-hover-drag(block.flat-index);
-                                        }
-                                    }
-
-                                    pointer-event(ev) => {
-                                        if (ev.kind == PointerEventKind.down) {
-                                            root.input-menu-open = false;
-                                            AppState.session-menu-open = false;
-                                            key-handler.focus();
-                                            if (ev.button == PointerEventButton.left) {
-                                                AppState.context-menu-open = false;
-                                                AppState.is-drag-selecting = true;
-                                                AppState.block-left-pressed(
-                                                    block.flat-index,
-                                                    ev.modifiers.shift,
-                                                    ev.modifiers.control
-                                                );
-                                            } else if (ev.button == PointerEventButton.right) {
-                                                AppState.is-drag-selecting = false;
-                                                AppState.block-right-clicked(
-                                                    block.flat-index,
-                                                    block.msg-index,
-                                                    block.block-type == BlockType.table-block,
-                                                    (sidebar.width + chat-flick.x + block-container.x + self.mouse-x) / 1px,
-                                                    (40px + chat-flick.y + chat-flick.content-y + block-container.y + self.mouse-y) / 1px
-                                                );
-                                            }
-                                        } else if (ev.kind == PointerEventKind.up || ev.kind == PointerEventKind.cancel) {
-                                            AppState.is-drag-selecting = false;
-                                        }
-                                    }
-
-                                    moved => {
-                                        if (AppState.is-drag-selecting && self.pressed) {
-                                            AppState.block-hover-drag(block.flat-index);
-                                            // Fix M6: 拖拽选区靠近视口上下边缘（36px）时自动步进滚屏
-                                            let mouse-in-flick-y = chat-flick.content-y + block-container.y + self.mouse-y;
-                                            let min-cy = min(0px, chat-flick.height - chat-flick.content-height);
-                                            let max-s = max(0.0, -min-cy / 1px);
-                                            if (mouse-in-flick-y < 36px && chat-flick.content-y < 0px) {
-                                                AppState.auto-scroll-sticky = false;
-                                                chat-flick.content-y = min(0px, chat-flick.content-y + 18px);
-                                                AppState.lenis-sync-chat(-chat-flick.content-y / 1px, max-s);
-                                            } else if (mouse-in-flick-y > chat-flick.height - 36px && chat-flick.content-y > min-cy) {
-                                                chat-flick.content-y = max(min-cy, chat-flick.content-y - 18px);
-                                                AppState.lenis-sync-chat(-chat-flick.content-y / 1px, max-s);
-                                            }
-                                        } else if (!self.pressed && AppState.is-drag-selecting) {
-                                            AppState.is-drag-selecting = false;
-                                        }
                                     }
                                 }
 
@@ -2819,6 +2973,7 @@ export component MainWindow inherits Window {
                                         vertical-stretch: 0;
                                         UserMessageBubble {
                                             text: block.text;
+                                            rich-lines: block.rich-lines;
                                             selected: block.selected;
                                             max-width: 520px;
                                         }
@@ -2864,6 +3019,7 @@ export component MainWindow inherits Window {
                                     }
 
                                     if (block.block-type == BlockType.list-block) : ListBlockView {
+                                        flat-index: block.flat-index;
                                         items: block.list-items;
                                     }
 
@@ -2875,19 +3031,25 @@ export component MainWindow inherits Window {
                                     }
 
                                     if (block.block-type == BlockType.code-block) : CodeBlockView {
+                                        flat-index: block.flat-index;
                                         lang: block.lang;
                                         raw-code: block.text;
                                         lines: block.code-lines;
                                         max-cols: block.max-code-cols;
                                         is-streaming-tail: false;
+                                        chat-flick-abs-x: chat-flick.absolute-position.x;
+                                        chat-flick-abs-y: chat-flick.absolute-position.y;
                                     }
 
                                     if (block.block-type == BlockType.active-code-tail) : CodeBlockView {
+                                        flat-index: block.flat-index;
                                         lang: block.lang;
                                         raw-code: block.text;
                                         lines: [];
                                         max-cols: block.max-code-cols;
                                         is-streaming-tail: true;
+                                        chat-flick-abs-x: chat-flick.absolute-position.x;
+                                        chat-flick-abs-y: chat-flick.absolute-position.y;
                                     }
 
                                     if (block.block-type == BlockType.diagram-block) : DiagramBlockView {
@@ -2921,6 +3083,8 @@ export component MainWindow inherits Window {
                                         summary: block.text;
                                         detail-text: block.detail-text;
                                         is-expanded: block.is-expanded;
+                                        chat-flick-abs-x: chat-flick.absolute-position.x;
+                                        chat-flick-abs-y: chat-flick.absolute-position.y;
                                         toggle => {
                                             AppState.toggle-capsule(block.flat-index);
                                         }
@@ -2930,6 +3094,16 @@ export component MainWindow inherits Window {
                                         lines: block.rich-lines;
                                         font-size: 14px;
                                     }
+                                }
+
+                                // Chrome 级字符选区半透明高亮层（仅对当前可视块渲染）
+                                for sel in block.selection-rects : Rectangle {
+                                    x: sel.x;
+                                    y: sel.y;
+                                    width: sel.width;
+                                    height: sel.height;
+                                    border-radius: 2px;
+                                    background: Theme.selection-bg;
                                 }
                             }
 
