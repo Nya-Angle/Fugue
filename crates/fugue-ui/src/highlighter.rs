@@ -102,8 +102,78 @@ pub fn str_visual_cols(s: &str) -> usize {
     s.chars().map(char_visual_cols).sum()
 }
 
+use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use parking_lot::RwLock;
+
+const MAX_HIGHLIGHT_CACHE_ENTRIES: usize = 128;
+
+struct HighlightCacheEntry {
+    code: String,
+    lines: Vec<HighlightLine>,
+    last_used: u64,
+}
+
+type HighlightCacheKey = (u64, String, bool);
+static HIGHLIGHT_CACHE: OnceLock<RwLock<HashMap<HighlightCacheKey, HighlightCacheEntry>>> =
+    OnceLock::new();
+static HIGHLIGHT_CLOCK: AtomicU64 = AtomicU64::new(1);
+
+fn get_highlight_cache() -> &'static RwLock<HashMap<HighlightCacheKey, HighlightCacheEntry>> {
+    HIGHLIGHT_CACHE.get_or_init(|| RwLock::new(HashMap::with_capacity(32)))
+}
+
 pub fn highlight_code(code: &str, lang: &str, dark_mode: bool) -> Vec<HighlightLine> {
     let lang = lang.trim().to_lowercase();
+    let mut hasher = DefaultHasher::new();
+    code.hash(&mut hasher);
+    let cache_key = (hasher.finish(), lang.clone(), dark_mode);
+
+    if let Some(hit) = {
+        let mut cache = get_highlight_cache().write();
+        if let Some(entry) = cache.get_mut(&cache_key) {
+            if entry.code == code {
+                entry.last_used = HIGHLIGHT_CLOCK.fetch_add(1, Ordering::Relaxed);
+                Some(entry.lines.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } {
+        return hit;
+    }
+
+    let lines = highlight_code_uncached(code, &lang, dark_mode);
+    {
+        let mut cache = get_highlight_cache().write();
+        if cache.len() >= MAX_HIGHLIGHT_CACHE_ENTRIES {
+            let evict_cnt = (MAX_HIGHLIGHT_CACHE_ENTRIES / 4).max(1);
+            let mut ages: Vec<(HighlightCacheKey, u64)> = cache
+                .iter()
+                .map(|(k, v)| (k.clone(), v.last_used))
+                .collect();
+            ages.sort_unstable_by_key(|(_, ts)| *ts);
+            for (old_k, _) in ages.into_iter().take(evict_cnt) {
+                cache.remove(&old_k);
+            }
+        }
+        cache.insert(
+            cache_key,
+            HighlightCacheEntry {
+                code: code.to_string(),
+                lines: lines.clone(),
+                last_used: HIGHLIGHT_CLOCK.fetch_add(1, Ordering::Relaxed),
+            },
+        );
+    }
+    lines
+}
+
+fn highlight_code_uncached(code: &str, lang: &str, dark_mode: bool) -> Vec<HighlightLine> {
     let mut lines = Vec::new();
 
     let default_color = if dark_mode { [212, 212, 212] } else { [36, 41, 46] };
@@ -114,7 +184,7 @@ pub fn highlight_code(code: &str, lang: &str, dark_mode: bool) -> Vec<HighlightL
     let number_color = if dark_mode { [181, 206, 168] } else { [0, 92, 197] };
 
     let supports_c_comments = matches!(
-        lang.as_str(),
+        lang,
         "rust"
             | "rs"
             | "c"
@@ -130,12 +200,12 @@ pub fn highlight_code(code: &str, lang: &str, dark_mode: bool) -> Vec<HighlightL
             | ""
     );
     let supports_hash_comments = matches!(
-        lang.as_str(),
+        lang,
         "python" | "py" | "sh" | "bash" | "yaml" | "yml" | "toml" | "ruby"
     );
-    let supports_triple_quotes = matches!(lang.as_str(), "python" | "py" | "rust" | "rs" | "");
+    let supports_triple_quotes = matches!(lang, "python" | "py" | "rust" | "rs" | "");
     let supports_backtick_strings = matches!(
-        lang.as_str(),
+        lang,
         "js" | "javascript" | "ts" | "typescript" | "go"
     );
 

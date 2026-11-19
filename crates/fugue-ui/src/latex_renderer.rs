@@ -5,6 +5,7 @@
 //! `\left/\right`, and multi-character superscripts/subscripts (Fix U1).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use latex_rust::font::MathFont;
@@ -16,10 +17,15 @@ use slint::Image;
 const MAX_FORMULA_CACHE_ENTRIES: usize = 256;
 
 type FormulaCacheKey = (String, bool, bool);
-type FormulaCacheMap = HashMap<FormulaCacheKey, Arc<[u8]>>;
+struct FormulaCacheEntry {
+    bytes: Arc<[u8]>,
+    last_used: u64,
+}
+type FormulaCacheMap = HashMap<FormulaCacheKey, FormulaCacheEntry>;
 
 static MATH_FONT: OnceLock<Option<MathFont>> = OnceLock::new();
 static FORMULA_PNG_CACHE: OnceLock<RwLock<FormulaCacheMap>> = OnceLock::new();
+static FORMULA_ACCESS_CLOCK: AtomicU64 = AtomicU64::new(1);
 
 fn get_math_font() -> Option<&'static MathFont> {
     MATH_FONT
@@ -58,8 +64,16 @@ pub fn render_latex_to_png_bytes(
     }
 
     let key = (clean_latex.to_string(), dark_mode, display);
-    if let Some(cached) = get_cache().read().get(&key) {
-        return Some(cached.clone());
+    if let Some(hit) = {
+        let mut cache = get_cache().write();
+        if let Some(entry) = cache.get_mut(&key) {
+            entry.last_used = FORMULA_ACCESS_CLOCK.fetch_add(1, Ordering::Relaxed);
+            Some(entry.bytes.clone())
+        } else {
+            None
+        }
+    } {
+        return Some(hit);
     }
 
     let font = get_math_font()?;
@@ -80,9 +94,25 @@ pub fn render_latex_to_png_bytes(
             let shared: Arc<[u8]> = Arc::from(png_bytes);
             let mut cache = get_cache().write();
             if cache.len() >= MAX_FORMULA_CACHE_ENTRIES {
-                cache.clear();
+                // Evict oldest 25% entries instead of clearing the entire cache
+                let evict_cnt = (MAX_FORMULA_CACHE_ENTRIES / 4).max(1);
+                let mut ages: Vec<(FormulaCacheKey, u64)> = cache
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.last_used))
+                    .collect();
+                ages.sort_unstable_by_key(|(_, ts)| *ts);
+                for (old_k, _) in ages.into_iter().take(evict_cnt) {
+                    cache.remove(&old_k);
+                }
             }
-            cache.insert(key, shared.clone());
+            let ts = FORMULA_ACCESS_CLOCK.fetch_add(1, Ordering::Relaxed);
+            cache.insert(
+                key,
+                FormulaCacheEntry {
+                    bytes: shared.clone(),
+                    last_used: ts,
+                },
+            );
             Some(shared)
         }
         Err(_) => None,
@@ -110,7 +140,9 @@ pub fn is_complex_inline_math(latex_src: &str) -> bool {
         || latex_src.contains("\\int")
         || latex_src.contains("\\prod")
         || latex_src.contains("\\lim")
-        || latex_src.contains("\\ матриц")
+        || latex_src.contains("\\matrix")
+        || latex_src.contains("\\pmatrix")
+        || latex_src.contains("\\bmatrix")
         || latex_src.contains("\\begin")
 }
 
