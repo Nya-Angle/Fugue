@@ -21,8 +21,10 @@ pub mod smooth_scroll;
 pub mod stream_automaton;
 pub mod viewport_culler;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
+use std::ops::Range;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,7 +42,7 @@ use markdown_parser::{
     table_markdown_to_plain_text, table_markdown_to_tsv, visual_char_width,
 };
 use parking_lot::RwLock;
-use slint::{Color, ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use smooth_scroll::LenisScrollManager;
 use stream_automaton::{BlockKind, StreamBlock, StreamBlockAutomaton};
 use viewport_culler::FenwickViewportIndex;
@@ -51,7 +53,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 slint::include_modules!();
 
 const DEFAULT_INLINE_COLS: usize = 68;
-const VIEWPORT_OVERSCAN_PX: f32 = 240.0;
+const VIEWPORT_OVERSCAN_PX: f32 = 640.0;
 
 #[derive(Clone)]
 struct CachedFrozenBlock {
@@ -120,6 +122,11 @@ struct UiViewportState {
     selection_anchor: Option<usize>,
     context_target_flat: Option<usize>,
     context_target_msg: Option<usize>,
+    /// Persistent VecModel bound once to `MainWindow::visible-blocks` to enable incremental diffing.
+    visible_model: Rc<VecModel<RenderBlockData>>,
+    visible_model_bound: bool,
+    mounted_range: Range<usize>,
+    mounted_style: (bool, usize),
 }
 
 impl Default for UiViewportState {
@@ -142,6 +149,10 @@ impl Default for UiViewportState {
             selection_anchor: None,
             context_target_flat: None,
             context_target_msg: None,
+            visible_model: Rc::new(VecModel::default()),
+            visible_model_bound: false,
+            mounted_range: 0..0,
+            mounted_style: (false, DEFAULT_INLINE_COLS),
         }
     }
 }
@@ -149,44 +160,77 @@ impl Default for UiViewportState {
 thread_local! {
     static UI_VIEWPORT_STATE: RefCell<UiViewportState> = RefCell::new(UiViewportState::default());
     static LENIS_STATE: RefCell<LenisScrollManager> = const { RefCell::new(LenisScrollManager::new()) };
-    static LENIS_TIMER: slint::Timer = slint::Timer::default();
+    static LAST_SENT_CHAT_Y: Cell<f32> = const { Cell::new(f32::NAN) };
 }
 
-/// Starts the 120Hz (8ms) Lenis frame timer on demand and automatically stops it on sub-pixel convergence
-/// so idle CPU usage is strictly 0%.
-fn ensure_lenis_timer_running(app_weak: slint::Weak<MainWindow>) {
-    LENIS_TIMER.with(|timer| {
-        if !timer.running() {
-            timer.start(
-                slint::TimerMode::Repeated,
-                Duration::from_millis(8),
-                move || {
-                    let Some(handle) = app_weak.upgrade() else {
-                        LENIS_TIMER.with(|t| t.stop());
-                        return;
-                    };
-                    let (chat_y, sidebar_y, input_y, _code_x, still_active) =
-                        LENIS_STATE.with(|cell| {
-                            let mut mgr = cell.borrow_mut();
-                            let (c, s, i, h) = mgr.step_all();
-                            (c, s, i, h, mgr.any_active())
-                        });
-                    if let Some(y) = chat_y {
-                        handle.invoke_set_chat_scroll_y(y);
-                    }
-                    if let Some(y) = sidebar_y {
-                        handle.invoke_set_sidebar_scroll_y(y);
-                    }
-                    if let Some(y) = input_y {
-                        handle.invoke_set_input_scroll_y(y);
-                    }
-                    if !still_active {
-                        LENIS_TIMER.with(|t| t.stop());
-                    }
-                },
-            );
-        }
+/// Advances all active Lenis scroll axes by one VSync-locked frame tick and deactivates the
+/// Slint `animation-tick()` clock on sub-pixel convergence so idle CPU usage is strictly 0%.
+fn step_lenis_frame(handle: &MainWindow) {
+    let (chat_y, sidebar_y, input_y, _code_x, still_active) = LENIS_STATE.with(|cell| {
+        let mut mgr = cell.borrow_mut();
+        let (c, s, i, h) = mgr.step_all();
+        (c, s, i, h, mgr.any_active())
     });
+
+    if let Some(y) = chat_y {
+        let should_emit = LAST_SENT_CHAT_Y.with(|last| {
+            let prev = last.get();
+            if !still_active || prev.is_nan() || (y - prev).abs() >= 0.25 {
+                last.set(y);
+                true
+            } else {
+                false
+            }
+        });
+        if should_emit {
+            handle.invoke_set_chat_scroll_y(y);
+            UI_VIEWPORT_STATE.with(|cell| {
+                let mut vp = cell.borrow_mut();
+                let old_slice = vp.fenwick.query_viewport(
+                    vp.scroll_y,
+                    vp.viewport_height,
+                    VIEWPORT_OVERSCAN_PX,
+                );
+                vp.scroll_y = y.max(0.0);
+                let new_slice = vp.fenwick.query_viewport(
+                    vp.scroll_y,
+                    vp.viewport_height,
+                    VIEWPORT_OVERSCAN_PX,
+                );
+                if old_slice.start_idx != new_slice.start_idx
+                    || old_slice.end_idx != new_slice.end_idx
+                {
+                    apply_viewport_slice(handle, &mut vp);
+                }
+            });
+        }
+    }
+    if let Some(y) = sidebar_y {
+        handle.invoke_set_sidebar_scroll_y(y);
+    }
+    if let Some(y) = input_y {
+        handle.invoke_set_input_scroll_y(y);
+    }
+
+    if !still_active {
+        LAST_SENT_CHAT_Y.with(|last| last.set(f32::NAN));
+        let state = handle.global::<AppState>();
+        if state.get_lenis_active() {
+            state.set_lenis_active(false);
+        }
+    }
+}
+
+/// Activates the VSync-synchronized Slint `animation-tick()` Lenis loop on demand.
+fn ensure_lenis_timer_running(app_weak: slint::Weak<MainWindow>) {
+    let Some(handle) = app_weak.upgrade() else {
+        return;
+    };
+    let state = handle.global::<AppState>();
+    if !state.get_lenis_active() {
+        state.set_lenis_active(true);
+    }
+    handle.window().request_redraw();
 }
 
 fn format_updated_time_label(updated_at_ms: u64) -> String {
@@ -418,8 +462,11 @@ fn load_session_into_ui(
         vp.selection_anchor = None;
         vp.context_target_flat = None;
         vp.context_target_msg = None;
+        vp.visible_model.set_vec(Vec::new());
+        vp.mounted_range = 0..0;
     });
 
+    LAST_SENT_CHAT_Y.with(|last| last.set(f32::NAN));
     LENIS_STATE.with(|cell| {
         cell.borrow_mut().chat.jump_to(0.0, 0.0);
     });
@@ -1149,6 +1196,95 @@ fn sync_and_cull_ui(window: &MainWindow, records: &[MessageRecord], dark_mode: b
     });
 }
 
+/// Compiles or retrieves a cached `RenderBlockData` for `flat_blocks[idx]`.
+fn compile_entry_render_data(idx: usize, vp_state: &mut UiViewportState) -> Option<RenderBlockData> {
+    let dark_mode = vp_state.dark_mode;
+    let max_cols = vp_state.max_cols;
+    let selected = vp_state.selected_indices.contains(&idx);
+    let entry = &vp_state.flat_blocks[idx];
+
+    if entry.is_user {
+        return entry.render_data.as_ref().map(|rdata| {
+            let mut d = rdata.clone();
+            d.flat_index = idx as i32;
+            d.selected = selected;
+            d
+        });
+    }
+
+    let msg_idx = entry.msg_index;
+    let b_idx = entry.block_index;
+    let is_first = entry.is_first_in_msg;
+    let is_tail = entry.is_active_tail;
+    let block_id = entry.block_id.clone();
+
+    if is_tail {
+        let sb = entry.source_block.clone()?;
+        let (mut rdata, est_h, _) = compile_stream_block_to_render_data(
+            msg_idx,
+            &sb,
+            dark_mode,
+            max_cols,
+            Some(&mut vp_state.active_tail_cache),
+        );
+        rdata.flat_index = idx as i32;
+        rdata.msg_index = msg_idx as i32;
+        rdata.block_index = b_idx as i32;
+        rdata.selected = selected;
+        rdata.is_first_in_msg = is_first;
+        if !vp_state.measured_heights.contains_key(&(msg_idx, block_id)) {
+            vp_state.fenwick.update_height(idx, est_h);
+        }
+        return Some(rdata);
+    }
+
+    let cache_key = (msg_idx, block_id);
+    let sb_opt = entry.source_block.clone();
+    let wanted_expanded = match sb_opt.as_ref().map(|s| &s.kind) {
+        Some(BlockKind::ActionCapsule { is_expanded, .. }) => *is_expanded,
+        _ => false,
+    };
+
+    let needs_compile = match vp_state.frozen_cache.get(&cache_key) {
+        Some(cached) => {
+            cached.dark_mode != dark_mode
+                || cached.max_cols != max_cols
+                || cached.is_expanded != wanted_expanded
+        }
+        None => true,
+    };
+
+    if needs_compile {
+        if let Some(ref sb) = sb_opt {
+            let (compiled, est_h, _) =
+                compile_stream_block_to_render_data(msg_idx, sb, dark_mode, max_cols, None);
+            vp_state.frozen_cache.insert(
+                cache_key.clone(),
+                CachedFrozenBlock {
+                    render_data: compiled,
+                    estimated_height: est_h,
+                    dark_mode,
+                    max_cols,
+                    is_expanded: wanted_expanded,
+                },
+            );
+            if !vp_state.measured_heights.contains_key(&cache_key) {
+                vp_state.fenwick.update_height(idx, est_h);
+            }
+        }
+    }
+
+    vp_state.frozen_cache.get(&cache_key).map(|cached| {
+        let mut d = cached.render_data.clone();
+        d.flat_index = idx as i32;
+        d.msg_index = msg_idx as i32;
+        d.block_index = b_idx as i32;
+        d.selected = selected;
+        d.is_first_in_msg = is_first;
+        d
+    })
+}
+
 /// Lazily compiles ONLY the blocks inside `[slice.start_idx .. slice.end_idx)` (Fix F4 & L2).
 fn apply_viewport_slice(window: &MainWindow, vp_state: &mut UiViewportState) {
     let slice = vp_state.fenwick.query_viewport(
@@ -1159,97 +1295,90 @@ fn apply_viewport_slice(window: &MainWindow, vp_state: &mut UiViewportState) {
 
     let dark_mode = vp_state.dark_mode;
     let max_cols = vp_state.max_cols;
-    let mut visible = Vec::with_capacity(slice.end_idx.saturating_sub(slice.start_idx));
 
-    for idx in slice.start_idx..slice.end_idx {
-        let selected = vp_state.selected_indices.contains(&idx);
-        let entry = &vp_state.flat_blocks[idx];
+    if !vp_state.visible_model_bound {
+        window.set_visible_blocks(ModelRc::from(vp_state.visible_model.clone()));
+        vp_state.visible_model_bound = true;
+    }
 
-        if entry.is_user {
-            if let Some(ref rdata) = entry.render_data {
-                let mut d = rdata.clone();
-                d.flat_index = idx as i32;
-                d.selected = selected;
+    let new_range = slice.start_idx..slice.end_idx;
+    let old_range = vp_state.mounted_range.clone();
+    let style_changed = vp_state.mounted_style != (dark_mode, max_cols);
+    let current_row_count = vp_state.visible_model.row_count();
+
+    if new_range.is_empty() {
+        if current_row_count > 0 {
+            vp_state.visible_model.set_vec(Vec::new());
+        }
+    } else if style_changed
+        || old_range.is_empty()
+        || current_row_count != old_range.len()
+        || new_range.end <= old_range.start
+        || new_range.start >= old_range.end
+    {
+        let mut visible = Vec::with_capacity(new_range.len());
+        for idx in new_range.clone() {
+            if let Some(d) = compile_entry_render_data(idx, vp_state) {
                 visible.push(d);
             }
-            continue;
         }
+        vp_state.visible_model.set_vec(visible);
+    } else {
+        let overlap_start = old_range.start.max(new_range.start);
+        let overlap_end = old_range.end.min(new_range.end);
 
-        let msg_idx = entry.msg_index;
-        let b_idx = entry.block_index;
-        let is_first = entry.is_first_in_msg;
-        let is_tail = entry.is_active_tail;
-        let block_id = entry.block_id.clone();
-
-        if is_tail {
-            if let Some(sb) = entry.source_block.clone() {
-                let (mut rdata, est_h, _) = compile_stream_block_to_render_data(
-                    msg_idx,
-                    &sb,
-                    dark_mode,
-                    max_cols,
-                    Some(&mut vp_state.active_tail_cache),
-                );
-                rdata.flat_index = idx as i32;
-                rdata.msg_index = msg_idx as i32;
-                rdata.block_index = b_idx as i32;
-                rdata.selected = selected;
-                rdata.is_first_in_msg = is_first;
-                if !vp_state.measured_heights.contains_key(&(msg_idx, block_id)) {
-                    vp_state.fenwick.update_height(idx, est_h);
+        // 1. Trim items scrolled off the top
+        for _ in old_range.start..overlap_start {
+            vp_state.visible_model.remove(0);
+        }
+        // 2. Trim items scrolled off the bottom
+        for _ in overlap_end..old_range.end {
+            let last_idx = vp_state.visible_model.row_count().saturating_sub(1);
+            vp_state.visible_model.remove(last_idx);
+        }
+        // 3. Patch only changed items within the surviving overlap range (zero clone for static blocks)
+        for idx in overlap_start..overlap_end {
+            let local_idx = idx - overlap_start;
+            let selected = vp_state.selected_indices.contains(&idx);
+            let entry = &vp_state.flat_blocks[idx];
+            let wanted_expanded = match entry.source_block.as_ref().map(|s| &s.kind) {
+                Some(BlockKind::ActionCapsule { is_expanded, .. }) => *is_expanded,
+                _ => false,
+            };
+            let needs_patch = match vp_state.visible_model.row_data(local_idx) {
+                Some(old_item) => {
+                    entry.is_active_tail
+                        || old_item.flat_index != idx as i32
+                        || old_item.msg_index != entry.msg_index as i32
+                        || old_item.block_index != entry.block_index as i32
+                        || old_item.selected != selected
+                        || old_item.is_expanded != wanted_expanded
+                        || old_item.is_first_in_msg != entry.is_first_in_msg
                 }
-                visible.push(rdata);
-            }
-            continue;
-        }
-
-        // Closed block: check `frozen_cache` for matching `(dark_mode, max_cols, is_expanded)`
-        let cache_key = (msg_idx, block_id.clone());
-        let sb_opt = entry.source_block.clone();
-        let wanted_expanded = match sb_opt.as_ref().map(|s| &s.kind) {
-            Some(BlockKind::ActionCapsule { is_expanded, .. }) => *is_expanded,
-            _ => false,
-        };
-
-        let needs_compile = match vp_state.frozen_cache.get(&cache_key) {
-            Some(cached) => {
-                cached.dark_mode != dark_mode
-                    || cached.max_cols != max_cols
-                    || cached.is_expanded != wanted_expanded
-            }
-            None => true,
-        };
-
-        if needs_compile {
-            if let Some(ref sb) = sb_opt {
-                let (compiled, est_h, _) =
-                    compile_stream_block_to_render_data(msg_idx, sb, dark_mode, max_cols, None);
-                vp_state.frozen_cache.insert(
-                    cache_key.clone(),
-                    CachedFrozenBlock {
-                        render_data: compiled,
-                        estimated_height: est_h,
-                        dark_mode,
-                        max_cols,
-                        is_expanded: wanted_expanded,
-                    },
-                );
-                if !vp_state.measured_heights.contains_key(&cache_key) {
-                    vp_state.fenwick.update_height(idx, est_h);
+                None => true,
+            };
+            if needs_patch {
+                if let Some(new_item) = compile_entry_render_data(idx, vp_state) {
+                    vp_state.visible_model.set_row_data(local_idx, new_item);
                 }
             }
         }
-
-        if let Some(cached) = vp_state.frozen_cache.get(&cache_key) {
-            let mut d = cached.render_data.clone();
-            d.flat_index = idx as i32;
-            d.msg_index = msg_idx as i32;
-            d.block_index = b_idx as i32;
-            d.selected = selected;
-            d.is_first_in_msg = is_first;
-            visible.push(d);
+        // 4. Prepend items newly entering at the top
+        for idx in (new_range.start..overlap_start).rev() {
+            if let Some(new_item) = compile_entry_render_data(idx, vp_state) {
+                vp_state.visible_model.insert(0, new_item);
+            }
+        }
+        // 5. Append items newly entering at the bottom
+        for idx in overlap_end..new_range.end {
+            if let Some(new_item) = compile_entry_render_data(idx, vp_state) {
+                vp_state.visible_model.push(new_item);
+            }
         }
     }
+
+    vp_state.mounted_range = new_range;
+    vp_state.mounted_style = (dark_mode, max_cols);
 
     // Re-read spacer heights in case lazy compilation updated an unmeasured block height
     let updated_slice = vp_state.fenwick.query_viewport(
@@ -1262,7 +1391,6 @@ fn apply_viewport_slice(window: &MainWindow, vp_state: &mut UiViewportState) {
     state.set_top_spacer_height(updated_slice.top_spacer_height);
     state.set_bottom_spacer_height(updated_slice.bottom_spacer_height);
     state.set_selected_block_count(vp_state.selected_indices.len() as i32);
-    window.set_visible_blocks(ModelRc::new(VecModel::from(visible)));
 }
 
 fn serialize_single_block(entry: &FlatBlockEntry, mode: &str) -> String {
@@ -1571,6 +1699,15 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     // 7.2b Global Lenis (`duration = 1.2`, `lerp = 0.1`) Smooth Scroll Callbacks
+    app.global::<AppState>().on_lenis_frame_tick({
+        let app_weak = app.as_weak();
+        move || {
+            if let Some(handle) = app_weak.upgrade() {
+                step_lenis_frame(&handle);
+            }
+        }
+    });
+
     app.global::<AppState>().on_lenis_wheel_chat({
         let app_weak = app.as_weak();
         move |delta_y_px, max_scroll_px| {
