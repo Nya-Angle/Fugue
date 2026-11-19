@@ -10,6 +10,7 @@ slint = { version = "1.8", default-features = false, features = [
     "std",
     "compat-1-2",
     "backend-winit",
+    "renderer-femtovg",
     "renderer-software",
     "software-renderer-path",
     "software-renderer-systemfonts",

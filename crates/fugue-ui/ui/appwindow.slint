@@ -200,6 +200,8 @@ export global AppState {
     callback jump-to-search-hit(string, string, int); // (session_id, message_id, message_index)
 
     // 全局 Lenis (duration=1.2, lerp=0.1) 平滑滚动回调
+    in-out property <bool> lenis-active: false;
+    callback lenis-frame-tick();
     callback lenis-wheel-chat(float, float); // (delta_y_px, max_scroll_px)
     callback lenis-sync-chat(float, float); // (direct_pos_px, max_scroll_px)
     callback lenis-wheel-sidebar(float, float); // (delta_y_px, max_scroll_px)
@@ -2526,10 +2528,21 @@ export component MainWindow inherits Window {
     private property <bool> input-menu-open: false;
     private property <length> input-menu-x: 0px;
     private property <length> input-menu-y: 0px;
+    // 抑制 Rust 主动驱动 scroll_y 时触发的反向 viewport-scrolled 乒乓回调
+    private property <bool> suppress-viewport-callback: false;
+    // 与显示器 VSync 帧节拍严格 1:1 对齐的 Lenis 动画时钟（空闲时自动解绑，0% CPU）
+    private property <duration> lenis-frame-clock: AppState.lenis-active ? animation-tick() : 0ms;
+    changed lenis-frame-clock => {
+        if (AppState.lenis-active) {
+            AppState.lenis-frame-tick();
+        }
+    }
 
     // 暴露给 Rust Lenis 平滑滚动引擎的坐标驱动接口
     public function set-chat-scroll-y(pos-px: float) {
+        root.suppress-viewport-callback = true;
         chat-flick.content-y = -pos-px * 1px;
+        root.suppress-viewport-callback = false;
     }
 
     public function set-sidebar-scroll-y(pos-px: float) {
@@ -2654,7 +2667,9 @@ export component MainWindow inherits Window {
                         content-height: chat-layout.preferred-height;
 
                         changed content-y => {
-                            AppState.viewport-scrolled(-self.content-y / 1px, self.height / 1px, self.width / 1px);
+                            if (!root.suppress-viewport-callback) {
+                                AppState.viewport-scrolled(-self.content-y / 1px, self.height / 1px, self.width / 1px);
+                            }
                         }
                         changed height => {
                             AppState.viewport-scrolled(-self.content-y / 1px, self.height / 1px, self.width / 1px);
@@ -2707,7 +2722,7 @@ export component MainWindow inherits Window {
                             spacing: 0px;
                             padding-bottom: 24px;
 
-                            if (AppState.top-spacer-height > 0px) : Rectangle {
+                            Rectangle {
                                 height: AppState.top-spacer-height;
                                 vertical-stretch: 0;
                                 background: transparent;
@@ -2918,7 +2933,7 @@ export component MainWindow inherits Window {
                                 }
                             }
 
-                            if (AppState.bottom-spacer-height > 0px) : Rectangle {
+                            Rectangle {
                                 height: AppState.bottom-spacer-height;
                                 vertical-stretch: 0;
                                 background: transparent;
