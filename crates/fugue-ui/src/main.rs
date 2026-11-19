@@ -15,19 +15,22 @@
 pub mod client_control;
 pub mod deepseek_client;
 pub mod highlighter;
+pub mod io_worker;
 pub mod latex_renderer;
 pub mod markdown_parser;
+pub mod selection_engine;
 pub mod smooth_scroll;
 pub mod stream_automaton;
+pub mod text_metrics;
 pub mod viewport_culler;
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use client_control::ClientControlGateway;
 use deepseek_client::{ChatMessagePayload, DeepSeekClient, DeepSeekConfig, StreamEvent};
@@ -41,10 +44,17 @@ use markdown_parser::{
     layout_inline_runs_into_lines, markdown_to_plain_text, parse_mermaid_diagram,
     table_markdown_to_plain_text, table_markdown_to_tsv, visual_char_width,
 };
-use parking_lot::RwLock;
+use io_worker::{AsyncIoHandle, IoCommand};
+use parking_lot::{Mutex, RwLock};
+use selection_engine::{
+    compute_block_highlight_rects, expand_block_range, expand_word_at,
+    extract_block_selected_text, hit_test_block, make_span, BlockSelectableGeometry,
+    DragGestureState, SelectableLine, SelectableSpan, TextPos, TextSelection,
+};
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use smooth_scroll::LenisScrollManager;
 use stream_automaton::{BlockKind, StreamBlock, StreamBlockAutomaton};
+use text_metrics::{wrap_plain_text_lines, TextMetricStyle};
 use viewport_culler::FenwickViewportIndex;
 
 #[global_allocator]
@@ -116,10 +126,11 @@ struct UiViewportState {
     fenwick: FenwickViewportIndex,
     scroll_y: f32,
     viewport_height: f32,
+    viewport_width: f32,
     max_cols: usize,
     dark_mode: bool,
-    selected_indices: BTreeSet<usize>,
-    selection_anchor: Option<usize>,
+    text_selection: Option<TextSelection>,
+    drag_gesture: DragGestureState,
     context_target_flat: Option<usize>,
     context_target_msg: Option<usize>,
     /// Persistent VecModel bound once to `MainWindow::visible-blocks` to enable incremental diffing.
@@ -127,6 +138,10 @@ struct UiViewportState {
     visible_model_bound: bool,
     mounted_range: Range<usize>,
     mounted_style: (bool, usize),
+    /// Per-code-block horizontal scroll offset (`flat_idx -> scroll_x_px`).
+    code_scroll_x: HashMap<usize, f32>,
+    /// Per-code-block manual word-wrap toggle (`flat_idx -> wrap_enabled`).
+    code_wrap_states: HashMap<usize, bool>,
 }
 
 impl Default for UiViewportState {
@@ -143,16 +158,19 @@ impl Default for UiViewportState {
             fenwick: FenwickViewportIndex::new(),
             scroll_y: 0.0,
             viewport_height: 540.0,
+            viewport_width: 800.0,
             max_cols: DEFAULT_INLINE_COLS,
             dark_mode: false,
-            selected_indices: BTreeSet::new(),
-            selection_anchor: None,
+            text_selection: None,
+            drag_gesture: DragGestureState::default(),
             context_target_flat: None,
             context_target_msg: None,
             visible_model: Rc::new(VecModel::default()),
             visible_model_bound: false,
             mounted_range: 0..0,
             mounted_style: (false, DEFAULT_INLINE_COLS),
+            code_scroll_x: HashMap::new(),
+            code_wrap_states: HashMap::new(),
         }
     }
 }
@@ -173,17 +191,22 @@ fn step_lenis_frame(handle: &MainWindow) {
     });
 
     if let Some(y) = chat_y {
+        let emit_y = if std::env::var_os("FUGUE_HW_RENDER").is_some() {
+            y
+        } else {
+            y.round()
+        };
         let should_emit = LAST_SENT_CHAT_Y.with(|last| {
             let prev = last.get();
-            if !still_active || prev.is_nan() || (y - prev).abs() >= 0.25 {
-                last.set(y);
+            if !still_active || prev.is_nan() || (emit_y - prev).abs() >= 0.001 {
+                last.set(emit_y);
                 true
             } else {
                 false
             }
         });
         if should_emit {
-            handle.invoke_set_chat_scroll_y(y);
+            handle.invoke_set_chat_scroll_y(emit_y);
             UI_VIEWPORT_STATE.with(|cell| {
                 let mut vp = cell.borrow_mut();
                 let old_slice = vp.fenwick.query_viewport(
@@ -277,17 +300,8 @@ fn str_to_lang_pref(s: &str) -> LanguagePreference {
     }
 }
 
-fn refresh_search_hits_ui(window: &MainWindow, store: &SessionSandboxStore, query: &str) {
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
-        window
-            .global::<AppState>()
-            .set_search_hits(ModelRc::new(VecModel::default()));
-        return;
-    }
-
+fn apply_search_hits_to_ui(window: &MainWindow, hits: Vec<fugue_core::SearchMatchHit>) {
     let is_zh = window.global::<AppState>().get_lang() == "zh";
-    let hits = store.search_content(None, trimmed, 60);
     let items: Vec<SearchHitItemData> = hits
         .into_iter()
         .map(|h| {
@@ -322,6 +336,18 @@ fn refresh_search_hits_ui(window: &MainWindow, store: &SessionSandboxStore, quer
     window
         .global::<AppState>()
         .set_search_hits(ModelRc::new(VecModel::from(items)));
+}
+
+fn refresh_search_hits_ui(window: &MainWindow, store: &SessionSandboxStore, query: &str) {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        window
+            .global::<AppState>()
+            .set_search_hits(ModelRc::default());
+        return;
+    }
+    let hits = store.search_content(None, trimmed, 60);
+    apply_search_hits_to_ui(window, hits);
 }
 
 fn refresh_session_list_ui(window: &MainWindow, store: &SessionSandboxStore) {
@@ -386,13 +412,60 @@ fn persist_assistant_record_if_needed(
     false
 }
 
+struct GenerationCoordinator {
+    current_gen_id: AtomicU64,
+    active_cancel: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+    active_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
+}
+
+impl GenerationCoordinator {
+    fn new() -> Self {
+        Self {
+            current_gen_id: AtomicU64::new(0),
+            active_cancel: Mutex::new(None),
+            active_tasks: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn begin_generation(&self) -> (u64, tokio::sync::watch::Receiver<bool>) {
+        self.cancel_active();
+        let gen_id = self.current_gen_id.fetch_add(1, Ordering::SeqCst) + 1;
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        *self.active_cancel.lock() = Some(tx);
+        (gen_id, rx)
+    }
+
+    fn register_task(&self, gen_id: u64, handle: tokio::task::AbortHandle) {
+        if self.is_current(gen_id) {
+            self.active_tasks.lock().push(handle);
+        } else {
+            handle.abort();
+        }
+    }
+
+    fn cancel_active(&self) {
+        self.current_gen_id.fetch_add(1, Ordering::SeqCst);
+        if let Some(tx) = self.active_cancel.lock().take() {
+            let _ = tx.send(true);
+        }
+        let tasks = std::mem::take(&mut *self.active_tasks.lock());
+        for handle in tasks {
+            handle.abort();
+        }
+    }
+
+    fn is_current(&self, gen_id: u64) -> bool {
+        self.current_gen_id.load(Ordering::SeqCst) == gen_id
+    }
+}
+
 fn finalize_active_generation(
     window: &MainWindow,
     store: &SessionSandboxStore,
     records: &Arc<RwLock<Vec<MessageRecord>>>,
-    stop_signal: &Arc<AtomicBool>,
+    gen_coord: &GenerationCoordinator,
 ) {
-    stop_signal.store(true, Ordering::SeqCst);
+    gen_coord.cancel_active();
     let state = window.global::<AppState>();
     if state.get_is_generating() {
         state.set_is_generating(false);
@@ -458,17 +531,22 @@ fn load_session_into_ui(
         vp.active_tail_cache = ActiveTailLineCache::default();
         vp.fenwick = FenwickViewportIndex::new();
         vp.scroll_y = 0.0;
-        vp.selected_indices.clear();
-        vp.selection_anchor = None;
+        vp.text_selection = None;
+        vp.drag_gesture.release();
         vp.context_target_flat = None;
         vp.context_target_msg = None;
         vp.visible_model.set_vec(Vec::new());
         vp.mounted_range = 0..0;
+        vp.code_scroll_x.clear();
+        vp.code_wrap_states.clear();
     });
 
     LAST_SENT_CHAT_Y.with(|last| last.set(f32::NAN));
     LENIS_STATE.with(|cell| {
-        cell.borrow_mut().chat.jump_to(0.0, 0.0);
+        let mut mgr = cell.borrow_mut();
+        mgr.chat.jump_to(0.0, 0.0);
+        mgr.sidebar.jump_to(0.0, 0.0);
+        mgr.input.jump_to(0.0, 0.0);
     });
 
     let state = window.global::<AppState>();
@@ -481,7 +559,11 @@ fn load_session_into_ui(
     }
     state.set_has_messages(!new_recs.is_empty());
     state.set_auto_scroll_sticky(true);
+    state.set_is_drag_selecting(false);
+    state.set_context_menu_open(false);
+    state.set_session_menu_open(false);
     state.set_renaming_session_id(SharedString::default());
+    window.invoke_clear_input_text();
 
     {
         let mut recs_guard = records.write();
@@ -493,6 +575,115 @@ fn load_session_into_ui(
     window.invoke_set_chat_scroll_y(0.0);
     window.invoke_scroll_to_bottom_if_sticky();
     refresh_session_list_ui(window, store);
+}
+
+fn load_safe_local_image(url: &str) -> slint::Image {
+    let trimmed = url.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("data:")
+    {
+        return slint::Image::default();
+    }
+    let path = std::path::Path::new(trimmed);
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "bmp") {
+        return slint::Image::default();
+    }
+    let Ok(canon) = path.canonicalize() else {
+        return slint::Image::default();
+    };
+    let in_cwd = std::env::current_dir()
+        .ok()
+        .and_then(|d| d.canonicalize().ok())
+        .map(|d| canon.starts_with(&d))
+        .unwrap_or(false);
+    let in_fugue = fugue_kernel::resolve_user_fugue_root()
+        .canonicalize()
+        .ok()
+        .map(|d| canon.starts_with(&d))
+        .unwrap_or(false);
+    if in_cwd || in_fugue {
+        slint::Image::load_from_path(&canon).unwrap_or_default()
+    } else {
+        slint::Image::default()
+    }
+}
+
+fn is_safe_http_url(url: &str) -> bool {
+    let u = url.trim();
+    if !(u.starts_with("http://") || u.starts_with("https://")) {
+        return false;
+    }
+    !u.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
+fn open_external_url_safe(url: &str) -> bool {
+    let u = url.trim();
+    if !is_safe_http_url(u) {
+        return false;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", u])
+            .spawn()
+            .is_ok()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+fn toggle_task_checkbox_in_markdown(block_md: &str, item_idx: usize) -> Option<String> {
+    let mut lines: Vec<String> = block_md.lines().map(|l| l.to_string()).collect();
+    let mut list_item_counter = 0usize;
+    let mut changed = false;
+    for line in &mut lines {
+        let trimmed = line.trim_start();
+        let indent_len = line.len() - trimmed.len();
+        let rest_after_bullet = if let Some(r) = trimmed.strip_prefix("- ") {
+            Some((indent_len + 2, r))
+        } else if let Some(r) = trimmed.strip_prefix("* ") {
+            Some((indent_len + 2, r))
+        } else if let Some(dot_pos) = trimmed.find(". ") {
+            let prefix = &trimmed[..dot_pos];
+            if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) {
+                Some((indent_len + dot_pos + 2, &trimmed[dot_pos + 2..]))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((prefix_end, rest)) = rest_after_bullet {
+            if list_item_counter == item_idx {
+                if let Some(after_box) = rest.strip_prefix("[ ] ") {
+                    *line = format!("{}[x] {}", &line[..prefix_end], after_box);
+                    changed = true;
+                } else if let Some(after_box) = rest
+                    .strip_prefix("[x] ")
+                    .or_else(|| rest.strip_prefix("[X] "))
+                {
+                    *line = format!("{}[ ] {}", &line[..prefix_end], after_box);
+                    changed = true;
+                }
+                break;
+            }
+            list_item_counter += 1;
+        }
+    }
+    if changed {
+        Some(lines.join("\n"))
+    } else {
+        None
+    }
 }
 
 fn convert_spans_to_rich_lines(
@@ -513,6 +704,11 @@ fn convert_spans_to_rich_lines(
                         } else {
                             slint::Image::default()
                         };
+                    let image_source = if sp.text.starts_with("[🖼 ") && !sp.link_url.is_empty() {
+                        load_safe_local_image(&sp.link_url)
+                    } else {
+                        slint::Image::default()
+                    };
                     InlineSpanData {
                         text: SharedString::from(sp.text),
                         bold: sp.bold,
@@ -522,6 +718,7 @@ fn convert_spans_to_rich_lines(
                         math: sp.math,
                         link_url: SharedString::from(sp.link_url),
                         math_image,
+                        image_source,
                     }
                 })
                 .collect();
@@ -705,6 +902,7 @@ fn compile_stream_block_to_render_data(
         detail_text: SharedString::default(),
         is_expanded: false,
         selected: false,
+        selection_rects: ModelRc::default(),
         is_first_in_msg: false,
     };
 
@@ -916,18 +1114,30 @@ fn make_user_block_entry(
     flat_idx: usize,
     msg_idx: usize,
     raw_text: &str,
-    max_cols: usize,
+    viewport_width: f32,
     selected: bool,
     measured_heights: &HashMap<(usize, String), f32>,
 ) -> (FlatBlockEntry, f32) {
     let block_id = format!("user-{}", msg_idx);
-    // Fix L10: Accurate wrapped line count without double-counting lines().count()
-    let wrap_cols = max_cols.saturating_sub(16).max(20);
-    let line_cnt: usize = raw_text
-        .split('\n')
-        .map(|l| visual_char_width(l).max(1).div_ceil(wrap_cols))
-        .sum::<usize>()
-        .max(1);
+    let wrap_w = (viewport_width * 0.72).clamp(180.0, 492.0);
+    let wrapped_lines = wrap_plain_text_lines(raw_text, wrap_w, 14.0);
+    let line_cnt = wrapped_lines.len().max(1);
+    let rich_models: Vec<RichLineData> = wrapped_lines
+        .into_iter()
+        .map(|line_text| RichLineData {
+            spans: ModelRc::new(VecModel::from(vec![InlineSpanData {
+                text: SharedString::from(line_text),
+                bold: false,
+                italic: false,
+                code: false,
+                strikethrough: false,
+                math: false,
+                math_image: slint::Image::default(),
+                image_source: slint::Image::default(),
+                link_url: SharedString::default(),
+            }])),
+        })
+        .collect();
     let est_h = measured_heights
         .get(&(msg_idx, block_id.clone()))
         .copied()
@@ -941,7 +1151,7 @@ fn make_user_block_entry(
         block_type: BlockType::UserBubble,
         text: SharedString::from(raw_text),
         lang: SharedString::default(),
-        rich_lines: ModelRc::default(),
+        rich_lines: ModelRc::new(VecModel::from(rich_models)),
         list_items: ModelRc::default(),
         table_headers: ModelRc::default(),
         table_aligns: ModelRc::default(),
@@ -953,6 +1163,7 @@ fn make_user_block_entry(
         detail_text: SharedString::default(),
         is_expanded: false,
         selected,
+        selection_rects: ModelRc::default(),
         is_first_in_msg: true,
     };
 
@@ -1087,7 +1298,7 @@ fn sync_and_cull_ui(window: &MainWindow, records: &[MessageRecord], dark_mode: b
 
                     drop(auto);
                     let total_len = vp_state.flat_blocks.len();
-                    vp_state.selected_indices.retain(|&idx| idx < total_len);
+                    clamp_selection_to_len(&mut vp_state.text_selection, total_len);
                     apply_viewport_slice(window, &mut vp_state);
                     return;
                 }
@@ -1104,12 +1315,12 @@ fn sync_and_cull_ui(window: &MainWindow, records: &[MessageRecord], dark_mode: b
         for (msg_idx, rec) in records.iter().enumerate() {
             if rec.is_user {
                 let flat_idx = flat_blocks.len();
-                let selected = vp_state.selected_indices.contains(&flat_idx);
+                let selected = is_block_touched_by_selection(vp_state.text_selection, flat_idx);
                 let (entry, est_h) = make_user_block_entry(
                     flat_idx,
                     msg_idx,
                     &rec.accumulated_content,
-                    max_cols,
+                    vp_state.viewport_width,
                     selected,
                     &vp_state.measured_heights,
                 );
@@ -1191,25 +1402,65 @@ fn sync_and_cull_ui(window: &MainWindow, records: &[MessageRecord], dark_mode: b
         vp_state.synced_last_msg_closed = last_closed_cnt;
         vp_state.had_active_tail = last_had_tail;
         let total_len = vp_state.flat_blocks.len();
-        vp_state.selected_indices.retain(|&idx| idx < total_len);
+        clamp_selection_to_len(&mut vp_state.text_selection, total_len);
         apply_viewport_slice(window, &mut vp_state);
     });
+}
+
+#[inline]
+fn clamp_selection_to_len(sel: &mut Option<TextSelection>, total_len: usize) {
+    if total_len == 0 {
+        *sel = None;
+        return;
+    }
+    if let Some(ref mut s) = sel {
+        let max_idx = total_len - 1;
+        if s.anchor.flat_index > max_idx {
+            s.anchor.flat_index = max_idx;
+        }
+        if s.focus.flat_index > max_idx {
+            s.focus.flat_index = max_idx;
+        }
+    }
+}
+
+#[inline]
+fn is_block_touched_by_selection(sel: Option<TextSelection>, flat_idx: usize) -> bool {
+    match sel {
+        Some(s) if !s.is_collapsed() => {
+            let (start, end) = s.ordered();
+            flat_idx >= start.flat_index && flat_idx <= end.flat_index
+        }
+        _ => false,
+    }
 }
 
 /// Compiles or retrieves a cached `RenderBlockData` for `flat_blocks[idx]`.
 fn compile_entry_render_data(idx: usize, vp_state: &mut UiViewportState) -> Option<RenderBlockData> {
     let dark_mode = vp_state.dark_mode;
     let max_cols = vp_state.max_cols;
-    let selected = vp_state.selected_indices.contains(&idx);
+    let viewport_width = vp_state.viewport_width;
+    let text_sel = vp_state.text_selection;
+    let selected = is_block_touched_by_selection(text_sel, idx);
+    let block_h = vp_state.fenwick.get_height(idx);
+    let code_sx = vp_state.code_scroll_x.get(&idx).copied().unwrap_or(0.0);
+    let code_wrap = vp_state.code_wrap_states.get(&idx).copied().unwrap_or(false);
     let entry = &vp_state.flat_blocks[idx];
 
     if entry.is_user {
-        return entry.render_data.as_ref().map(|rdata| {
-            let mut d = rdata.clone();
-            d.flat_index = idx as i32;
-            d.selected = selected;
-            d
-        });
+        let mut d = entry.render_data.as_ref()?.clone();
+        d.flat_index = idx as i32;
+        d.selected = selected;
+        d.selection_rects = build_selection_rects_model(
+            entry,
+            &d,
+            viewport_width,
+            block_h,
+            code_sx,
+            code_wrap,
+            text_sel,
+        );
+        return Some(d);
     }
 
     let msg_idx = entry.msg_index;
@@ -1218,7 +1469,7 @@ fn compile_entry_render_data(idx: usize, vp_state: &mut UiViewportState) -> Opti
     let is_tail = entry.is_active_tail;
     let block_id = entry.block_id.clone();
 
-    if is_tail {
+    let compiled_tail = if is_tail {
         let sb = entry.source_block.clone()?;
         let (mut rdata, est_h, _) = compile_stream_block_to_render_data(
             msg_idx,
@@ -1235,52 +1486,83 @@ fn compile_entry_render_data(idx: usize, vp_state: &mut UiViewportState) -> Opti
         if !vp_state.measured_heights.contains_key(&(msg_idx, block_id)) {
             vp_state.fenwick.update_height(idx, est_h);
         }
-        return Some(rdata);
-    }
+        Some(rdata)
+    } else {
+        let cache_key = (msg_idx, block_id);
+        let sb_opt = entry.source_block.clone();
+        let wanted_expanded = match sb_opt.as_ref().map(|s| &s.kind) {
+            Some(BlockKind::ActionCapsule { is_expanded, .. }) => *is_expanded,
+            _ => false,
+        };
 
-    let cache_key = (msg_idx, block_id);
-    let sb_opt = entry.source_block.clone();
-    let wanted_expanded = match sb_opt.as_ref().map(|s| &s.kind) {
-        Some(BlockKind::ActionCapsule { is_expanded, .. }) => *is_expanded,
-        _ => false,
-    };
+        let needs_compile = match vp_state.frozen_cache.get(&cache_key) {
+            Some(cached) => {
+                cached.dark_mode != dark_mode
+                    || cached.max_cols != max_cols
+                    || cached.is_expanded != wanted_expanded
+            }
+            None => true,
+        };
 
-    let needs_compile = match vp_state.frozen_cache.get(&cache_key) {
-        Some(cached) => {
-            cached.dark_mode != dark_mode
-                || cached.max_cols != max_cols
-                || cached.is_expanded != wanted_expanded
-        }
-        None => true,
-    };
-
-    if needs_compile {
-        if let Some(ref sb) = sb_opt {
-            let (compiled, est_h, _) =
-                compile_stream_block_to_render_data(msg_idx, sb, dark_mode, max_cols, None);
-            vp_state.frozen_cache.insert(
-                cache_key.clone(),
-                CachedFrozenBlock {
-                    render_data: compiled,
-                    estimated_height: est_h,
-                    dark_mode,
-                    max_cols,
-                    is_expanded: wanted_expanded,
-                },
-            );
-            if !vp_state.measured_heights.contains_key(&cache_key) {
-                vp_state.fenwick.update_height(idx, est_h);
+        if needs_compile {
+            if let Some(ref sb) = sb_opt {
+                let (compiled, est_h, _) =
+                    compile_stream_block_to_render_data(msg_idx, sb, dark_mode, max_cols, None);
+                if vp_state.frozen_cache.len() >= 512 {
+                    let mounted_msgs: std::collections::HashSet<usize> = vp_state
+                        .flat_blocks
+                        .get(vp_state.mounted_range.clone())
+                        .map(|slice| slice.iter().map(|b| b.msg_index).collect())
+                        .unwrap_or_default();
+                    let evict_keys: Vec<(usize, String)> = vp_state
+                        .frozen_cache
+                        .keys()
+                        .filter(|(m, _)| !mounted_msgs.contains(m))
+                        .take(128)
+                        .cloned()
+                        .collect();
+                    for k in evict_keys {
+                        vp_state.frozen_cache.remove(&k);
+                    }
+                }
+                vp_state.frozen_cache.insert(
+                    cache_key.clone(),
+                    CachedFrozenBlock {
+                        render_data: compiled,
+                        estimated_height: est_h,
+                        dark_mode,
+                        max_cols,
+                        is_expanded: wanted_expanded,
+                    },
+                );
+                if !vp_state.measured_heights.contains_key(&cache_key) {
+                    vp_state.fenwick.update_height(idx, est_h);
+                }
             }
         }
-    }
 
-    vp_state.frozen_cache.get(&cache_key).map(|cached| {
-        let mut d = cached.render_data.clone();
-        d.flat_index = idx as i32;
-        d.msg_index = msg_idx as i32;
-        d.block_index = b_idx as i32;
-        d.selected = selected;
-        d.is_first_in_msg = is_first;
+        vp_state.frozen_cache.get(&cache_key).map(|cached| {
+            let mut d = cached.render_data.clone();
+            d.flat_index = idx as i32;
+            d.msg_index = msg_idx as i32;
+            d.block_index = b_idx as i32;
+            d.selected = selected;
+            d.is_first_in_msg = is_first;
+            d
+        })
+    };
+
+    compiled_tail.map(|mut d| {
+        let entry_ref = &vp_state.flat_blocks[idx];
+        d.selection_rects = build_selection_rects_model(
+            entry_ref,
+            &d,
+            viewport_width,
+            block_h,
+            code_sx,
+            code_wrap,
+            text_sel,
+        );
         d
     })
 }
@@ -1339,7 +1621,7 @@ fn apply_viewport_slice(window: &MainWindow, vp_state: &mut UiViewportState) {
         // 3. Patch only changed items within the surviving overlap range (zero clone for static blocks)
         for idx in overlap_start..overlap_end {
             let local_idx = idx - overlap_start;
-            let selected = vp_state.selected_indices.contains(&idx);
+            let selected = is_block_touched_by_selection(vp_state.text_selection, idx);
             let entry = &vp_state.flat_blocks[idx];
             let wanted_expanded = match entry.source_block.as_ref().map(|s| &s.kind) {
                 Some(BlockKind::ActionCapsule { is_expanded, .. }) => *is_expanded,
@@ -1390,7 +1672,412 @@ fn apply_viewport_slice(window: &MainWindow, vp_state: &mut UiViewportState) {
     let state = window.global::<AppState>();
     state.set_top_spacer_height(updated_slice.top_spacer_height);
     state.set_bottom_spacer_height(updated_slice.bottom_spacer_height);
-    state.set_selected_block_count(vp_state.selected_indices.len() as i32);
+    let has_sel = vp_state
+        .text_selection
+        .map(|s| !s.is_collapsed())
+        .unwrap_or(false);
+    state.set_selected_block_count(if has_sel { 1 } else { 0 });
+}
+
+fn build_rich_line_selectable(
+    line: RichLineData,
+    x0: f32,
+    y_top: f32,
+    font_size: f32,
+    default_bold: bool,
+    line_height: f32,
+) -> SelectableLine {
+    let mut spans = Vec::new();
+    let mut cur_x = x0;
+    let mut char_start = 0usize;
+    let mut plain = String::new();
+    let mut max_line_h = line_height;
+
+    for span in line.spans.iter() {
+        let text = span.text.to_string();
+        let cc = text.chars().count();
+        let img_sz = span.math_image.size();
+        if span.math && img_sz.width > 0 {
+            let img_w = img_sz.width as f32;
+            let img_h = img_sz.height as f32 + 4.0;
+            max_line_h = max_line_h.max(img_h);
+            let mut offsets = Vec::with_capacity(cc + 1);
+            offsets.push(0.0);
+            for i in 1..=cc {
+                offsets.push(img_w * (i as f32) / (cc.max(1) as f32));
+            }
+            spans.push(SelectableSpan {
+                text: text.clone(),
+                style: TextMetricStyle::MathSerif,
+                font_size,
+                x_offset: cur_x + 2.0,
+                width: img_w,
+                char_start,
+                char_offsets: offsets,
+            });
+            cur_x += img_w + 4.0;
+            char_start += cc;
+            plain.push_str(&text);
+            continue;
+        }
+
+        let is_bold = span.bold || default_bold;
+        let style = if span.code {
+            TextMetricStyle::Mono
+        } else if span.math {
+            TextMetricStyle::MathSerif
+        } else if is_bold && span.italic {
+            TextMetricStyle::BoldItalic
+        } else if is_bold {
+            TextMetricStyle::Bold
+        } else if span.italic {
+            TextMetricStyle::Italic
+        } else {
+            TextMetricStyle::Regular
+        };
+        let eff_size = if span.code { font_size - 1.0 } else { font_size };
+        let lead_pad = if span.code { 5.0 } else { 0.0 };
+        let trail_pad = if span.code { 5.0 } else { 0.0 };
+        let s = make_span(
+            text.clone(),
+            style,
+            eff_size,
+            cur_x + lead_pad,
+            char_start,
+            0.0,
+        );
+        cur_x += s.width + lead_pad + trail_pad;
+        char_start += cc;
+        plain.push_str(&text);
+        spans.push(s);
+    }
+
+    SelectableLine {
+        y_top,
+        height: max_line_h,
+        spans,
+        plain_text: plain,
+        char_count: char_start,
+        is_table_row: false,
+        table_cell_ranges: Vec::new(),
+    }
+}
+
+fn build_block_selectable_geometry(
+    entry: &FlatBlockEntry,
+    rdata: &RenderBlockData,
+    viewport_width: f32,
+    block_height_px: f32,
+    code_scroll_x: f32,
+    code_wrap: bool,
+) -> BlockSelectableGeometry {
+    let top_pad = if rdata.is_first_in_msg { 8.0 } else { 2.0 };
+    let mut lines = Vec::new();
+
+    match rdata.block_type {
+        BlockType::UserBubble => {
+            let mut max_line_w = 0.0f32;
+            let mut temp_lines = Vec::new();
+            for rl in rdata.rich_lines.iter() {
+                let sl = build_rich_line_selectable(rl, 0.0, 0.0, 14.0, false, 19.0);
+                let w: f32 = sl
+                    .spans
+                    .last()
+                    .map(|s| s.x_offset + s.width)
+                    .unwrap_or(0.0);
+                if w > max_line_w {
+                    max_line_w = w;
+                }
+                temp_lines.push(sl);
+            }
+            let bubble_w = (max_line_w + 28.0).clamp(48.0, 520.0);
+            let bubble_x = (viewport_width - 6.0 - bubble_w).max(6.0);
+            let text_x = bubble_x + 14.0;
+            let mut y = top_pad + 12.0;
+            for mut sl in temp_lines {
+                sl.y_top = y;
+                for sp in &mut sl.spans {
+                    sp.x_offset += text_x;
+                }
+                y += sl.height + 4.0;
+                lines.push(sl);
+            }
+        }
+        BlockType::Paragraph | BlockType::ActiveTail => {
+            let mut y = top_pad;
+            for rl in rdata.rich_lines.iter() {
+                let sl = build_rich_line_selectable(rl, 6.0, y, 14.0, false, 19.0);
+                y += sl.height + 4.0;
+                lines.push(sl);
+            }
+        }
+        BlockType::Heading1 => {
+            let mut y = top_pad;
+            for rl in rdata.rich_lines.iter() {
+                let sl = build_rich_line_selectable(rl, 6.0, y, 20.0, true, 26.0);
+                y += sl.height + 4.0;
+                lines.push(sl);
+            }
+        }
+        BlockType::Heading2 => {
+            let mut y = top_pad;
+            for rl in rdata.rich_lines.iter() {
+                let sl = build_rich_line_selectable(rl, 6.0, y, 17.0, true, 23.0);
+                y += sl.height + 4.0;
+                lines.push(sl);
+            }
+        }
+        BlockType::Heading3 => {
+            let mut y = top_pad;
+            for rl in rdata.rich_lines.iter() {
+                let sl = build_rich_line_selectable(rl, 6.0, y, 15.0, true, 21.0);
+                y += sl.height + 4.0;
+                lines.push(sl);
+            }
+        }
+        BlockType::Blockquote => {
+            let mut y = top_pad + 10.0;
+            for rl in rdata.rich_lines.iter() {
+                let sl = build_rich_line_selectable(rl, 23.5, y, 14.0, false, 19.0);
+                y += sl.height + 4.0;
+                lines.push(sl);
+            }
+        }
+        BlockType::ListBlock => {
+            let mut y = top_pad;
+            for item in rdata.list_items.iter() {
+                let x0 = 6.0 + (item.indent_level.max(0) as f32) * 18.0 + 20.0 + 8.0;
+                y += 1.0;
+                for rl in item.lines.iter() {
+                    let sl = build_rich_line_selectable(rl, x0, y, 14.0, false, 19.0);
+                    y += sl.height + 4.0;
+                    lines.push(sl);
+                }
+                y += 2.0; // remaining item spacing (6px total with 4px paragraph spacing)
+            }
+        }
+        BlockType::CodeBlock | BlockType::ActiveCodeTail => {
+            let mut y = top_pad + 32.0 + 12.0;
+            let use_wrapped = rdata.block_type == BlockType::ActiveCodeTail || code_wrap;
+            if !use_wrapped && rdata.code_lines.row_count() > 0 {
+                let x0 = 6.0 + 12.0 + 44.0 - code_scroll_x;
+                for cl in rdata.code_lines.iter() {
+                    let mut spans = Vec::new();
+                    let mut cur_x = x0;
+                    let mut char_start = 0usize;
+                    let mut plain = String::new();
+                    for tok in cl.tokens.iter() {
+                        let t = tok.text.to_string();
+                        let s = make_span(t.clone(), TextMetricStyle::Mono, 13.0, cur_x, char_start, 0.0);
+                        cur_x += s.width;
+                        char_start += t.chars().count();
+                        plain.push_str(&t);
+                        spans.push(s);
+                    }
+                    lines.push(SelectableLine {
+                        y_top: y,
+                        height: 17.5,
+                        spans,
+                        plain_text: plain,
+                        char_count: char_start,
+                        is_table_row: false,
+                        table_cell_ranges: Vec::new(),
+                    });
+                    y += 19.5;
+                }
+            } else {
+                let x0 = 6.0 + 12.0;
+                let wrap_w = (viewport_width - 36.0).max(120.0);
+                for raw_l in wrap_plain_text_lines(rdata.text.as_str(), wrap_w, 13.0) {
+                    let s = make_span(raw_l.clone(), TextMetricStyle::Mono, 13.0, x0, 0, 0.0);
+                    let cc = raw_l.chars().count();
+                    lines.push(SelectableLine {
+                        y_top: y,
+                        height: 17.5,
+                        spans: vec![s],
+                        plain_text: raw_l,
+                        char_count: cc,
+                        is_table_row: false,
+                        table_cell_ranges: Vec::new(),
+                    });
+                    y += 17.5;
+                }
+            }
+        }
+        BlockType::TableBlock => {
+            let col_count = rdata.table_headers.row_count().max(1);
+            let avail_w = (viewport_width - 12.0).max(120.0);
+            let inner_w = (avail_w - 24.0 - ((col_count.saturating_sub(1)) as f32) * 12.0).max(60.0);
+            let col_w = inner_w / (col_count as f32);
+            let aligns: Vec<i32> = rdata.table_aligns.iter().collect();
+            let mut y = top_pad + 29.0;
+
+            let build_table_row = |cells: Vec<String>, row_y: f32, min_row_h: f32, bold: bool| -> (SelectableLine, f32) {
+                let mut spans = Vec::new();
+                let mut ranges = Vec::new();
+                let mut char_start = 0usize;
+                let mut plain = String::new();
+                let mut max_lines = 1usize;
+                let style = if bold { TextMetricStyle::Bold } else { TextMetricStyle::Regular };
+                for (c_idx, cell) in cells.into_iter().enumerate() {
+                    let wrapped = wrap_plain_text_lines(&cell, col_w.max(24.0), 13.0);
+                    max_lines = max_lines.max(wrapped.len().max(1));
+                    let first_line = wrapped.first().map(|s| s.as_str()).unwrap_or("");
+                    let s_measure = make_span(first_line.to_string(), style, 13.0, 0.0, 0, 0.0);
+                    let col_x0 = 6.0 + 12.0 + (c_idx as f32) * (col_w + 12.0);
+                    let align = aligns.get(c_idx).copied().unwrap_or(0);
+                    let cell_x = match align {
+                        1 => col_x0 + ((col_w - s_measure.width).max(0.0) / 2.0),
+                        2 => col_x0 + (col_w - s_measure.width).max(0.0),
+                        _ => col_x0,
+                    };
+                    let cc = cell.chars().count();
+                    let s = make_span(cell.clone(), style, 13.0, cell_x, char_start, 0.0);
+                    spans.push(s);
+                    ranges.push((char_start, char_start + cc));
+                    char_start += cc;
+                    plain.push_str(&cell);
+                }
+                let actual_h = min_row_h.max((max_lines as f32) * 17.0 + 12.0);
+                (
+                    SelectableLine {
+                        y_top: row_y,
+                        height: actual_h,
+                        spans,
+                        plain_text: plain,
+                        char_count: char_start,
+                        is_table_row: true,
+                        table_cell_ranges: ranges,
+                    },
+                    actual_h,
+                )
+            };
+
+            let headers: Vec<String> = rdata.table_headers.iter().map(|s| s.to_string()).collect();
+            if !headers.is_empty() {
+                let (line, h) = build_table_row(headers, y, 34.0, true);
+                lines.push(line);
+                y += h;
+            }
+            for row in rdata.table_rows.iter() {
+                let cells: Vec<String> = row.cells.iter().map(|s| s.to_string()).collect();
+                let (line, h) = build_table_row(cells, y, 32.0, false);
+                lines.push(line);
+                y += h;
+            }
+        }
+        BlockType::LatexMath | BlockType::DiagramBlock | BlockType::ActionCapsule | BlockType::ThematicBreak => {
+            let h = (block_height_px - top_pad - 10.0).max(20.0);
+            return BlockSelectableGeometry {
+                lines: Vec::new(),
+                is_atomic: true,
+                atomic_rect: (6.0, top_pad, (viewport_width - 12.0).max(40.0), h),
+            };
+        }
+    }
+
+    let _ = entry;
+    BlockSelectableGeometry {
+        lines,
+        is_atomic: false,
+        atomic_rect: (0.0, 0.0, 0.0, 0.0),
+    }
+}
+
+fn build_selection_rects_model(
+    entry: &FlatBlockEntry,
+    rdata: &RenderBlockData,
+    viewport_width: f32,
+    block_height_px: f32,
+    code_scroll_x: f32,
+    code_wrap: bool,
+    text_sel: Option<TextSelection>,
+) -> ModelRc<SelectionRectData> {
+    let Some(sel) = text_sel else {
+        return ModelRc::default();
+    };
+    if sel.is_collapsed() || !is_block_touched_by_selection(Some(sel), entry.flat_index) {
+        return ModelRc::default();
+    }
+    let geom = build_block_selectable_geometry(
+        entry,
+        rdata,
+        viewport_width,
+        block_height_px,
+        code_scroll_x,
+        code_wrap,
+    );
+    let rects = compute_block_highlight_rects(entry.flat_index, &geom, sel);
+    if rects.is_empty() {
+        return ModelRc::default();
+    }
+    let slint_rects: Vec<SelectionRectData> = rects
+        .into_iter()
+        .map(|r| SelectionRectData {
+            x: r.x,
+            y: r.y,
+            width: r.width,
+            height: r.height,
+        })
+        .collect();
+    ModelRc::new(VecModel::from(slint_rects))
+}
+
+fn refresh_selection_overlays(window: &MainWindow, vp_state: &mut UiViewportState) {
+    let viewport_width = vp_state.viewport_width;
+    let text_sel = vp_state.text_selection;
+    let mounted = vp_state.mounted_range.clone();
+    for (local_idx, flat_idx) in mounted.enumerate() {
+        if let Some(mut row) = vp_state.visible_model.row_data(local_idx) {
+            if let Some(entry) = vp_state.flat_blocks.get(flat_idx) {
+                let touched = is_block_touched_by_selection(text_sel, flat_idx);
+                let block_h = vp_state.fenwick.get_height(flat_idx);
+                let code_sx = vp_state.code_scroll_x.get(&flat_idx).copied().unwrap_or(0.0);
+                let code_wrap = vp_state.code_wrap_states.get(&flat_idx).copied().unwrap_or(false);
+                let new_rects = build_selection_rects_model(
+                    entry,
+                    &row,
+                    viewport_width,
+                    block_h,
+                    code_sx,
+                    code_wrap,
+                    text_sel,
+                );
+                if row.selected != touched
+                    || row.selection_rects.row_count() > 0
+                    || new_rects.row_count() > 0
+                {
+                    row.selected = touched;
+                    row.selection_rects = new_rects;
+                    vp_state.visible_model.set_row_data(local_idx, row);
+                }
+            }
+        }
+    }
+    let has_sel = text_sel.map(|s| !s.is_collapsed()).unwrap_or(false);
+    window
+        .global::<AppState>()
+        .set_selected_block_count(if has_sel { 1 } else { 0 });
+}
+
+fn get_or_compile_geometry(
+    flat_idx: usize,
+    vp_state: &mut UiViewportState,
+) -> Option<BlockSelectableGeometry> {
+    let rdata = compile_entry_render_data(flat_idx, vp_state)?;
+    let block_h = vp_state.fenwick.get_height(flat_idx);
+    let viewport_w = vp_state.viewport_width;
+    let code_sx = vp_state.code_scroll_x.get(&flat_idx).copied().unwrap_or(0.0);
+    let code_wrap = vp_state.code_wrap_states.get(&flat_idx).copied().unwrap_or(false);
+    let entry = vp_state.flat_blocks.get(flat_idx)?;
+    Some(build_block_selectable_geometry(
+        entry,
+        &rdata,
+        viewport_w,
+        block_h,
+        code_sx,
+        code_wrap,
+    ))
 }
 
 fn serialize_single_block(entry: &FlatBlockEntry, mode: &str) -> String {
@@ -1417,29 +2104,63 @@ fn serialize_single_block(entry: &FlatBlockEntry, mode: &str) -> String {
     }
 }
 
-fn serialize_blocks_for_clipboard(vp_state: &UiViewportState, mode: &str) -> String {
-    let target_indices: Vec<usize> = if !vp_state.selected_indices.is_empty() {
-        vp_state.selected_indices.iter().copied().collect()
-    } else if let Some(idx) = vp_state.context_target_flat {
-        vec![idx]
-    } else {
-        Vec::new()
-    };
-
-    let mut chunks = Vec::new();
-    for idx in target_indices {
-        if let Some(entry) = vp_state.flat_blocks.get(idx) {
-            let chunk = serialize_single_block(entry, mode);
-            if !chunk.is_empty() {
-                chunks.push(chunk);
+fn serialize_blocks_for_clipboard(vp_state: &mut UiViewportState, mode: &str) -> String {
+    if let Some(sel) = vp_state.text_selection {
+        if !sel.is_collapsed() {
+            let (start, end) = sel.ordered();
+            let mut chunks = Vec::new();
+            for idx in start.flat_index..=end.flat_index {
+                let Some(entry) = vp_state.flat_blocks.get(idx).cloned() else {
+                    continue;
+                };
+                if mode == "copy_markdown" {
+                    let is_full_middle = idx > start.flat_index && idx < end.flat_index;
+                    if is_full_middle {
+                        let chunk = serialize_single_block(&entry, mode);
+                        if !chunk.is_empty() {
+                            chunks.push(chunk);
+                        }
+                        continue;
+                    }
+                    if let Some(geom) = get_or_compile_geometry(idx, vp_state) {
+                        let (full_s, full_e) = expand_block_range(idx, &geom);
+                        let covers_all = (idx > start.flat_index || start <= full_s)
+                            && (idx < end.flat_index || end >= full_e);
+                        if covers_all {
+                            let chunk = serialize_single_block(&entry, mode);
+                            if !chunk.is_empty() {
+                                chunks.push(chunk);
+                            }
+                        } else {
+                            let part = extract_block_selected_text(idx, &geom, &entry.raw_markdown, sel);
+                            if !part.is_empty() {
+                                chunks.push(part);
+                            }
+                        }
+                    }
+                } else if let Some(geom) = get_or_compile_geometry(idx, vp_state) {
+                    let part = extract_block_selected_text(idx, &geom, &entry.raw_markdown, sel);
+                    if !part.is_empty() {
+                        chunks.push(part);
+                    }
+                }
             }
+            return chunks.join("\n\n");
         }
     }
-    chunks.join("\n\n")
+
+    if let Some(idx) = vp_state.context_target_flat {
+        if let Some(entry) = vp_state.flat_blocks.get(idx) {
+            return serialize_single_block(entry, mode);
+        }
+    }
+    String::new()
 }
 
 fn main() -> Result<(), slint::PlatformError> {
-    if std::env::var_os("SLINT_BACKEND").is_none() {
+    if std::env::var_os("SLINT_BACKEND").is_none()
+        && std::env::var_os("FUGUE_HW_RENDER").is_none()
+    {
         std::env::set_var("SLINT_BACKEND", "winit-software");
     }
 
@@ -1472,20 +2193,22 @@ fn main() -> Result<(), slint::PlatformError> {
     let memory = Arc::new(LivingNodeMemory::new());
     let omni = Arc::new(OmniNode::new(memory.clone()));
 
-    // 4. Thread-safe message state & stop signal
+    // 4. Thread-safe message state & generation coordinator
     let records: Arc<RwLock<Vec<MessageRecord>>> = Arc::new(RwLock::new(Vec::new()));
-    let stop_signal = Arc::new(AtomicBool::new(false));
+    let gen_coord = Arc::new(GenerationCoordinator::new());
 
     // 5. Initialize Reserved LLM Client Control Gateway (with UI synchronization hook)
     let gateway_ui_hook = {
         let app_weak = app.as_weak();
         let store_for_hook = session_store.clone();
         let records_for_hook = records.clone();
+        let gen_coord_for_hook = gen_coord.clone();
         Arc::new(move |resp: &ClientControlResponse| {
             let resp_clone = resp.clone();
             let weak = app_weak.clone();
             let store = store_for_hook.clone();
             let recs = records_for_hook.clone();
+            let gen_coord = gen_coord_for_hook.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 let Some(handle) = weak.upgrade() else {
                     return;
@@ -1508,21 +2231,46 @@ fn main() -> Result<(), slint::PlatformError> {
                     ClientControlResponse::SessionDeleted { deleted_session_id } => {
                         let cur_sid = handle.global::<AppState>().get_current_session_id();
                         if cur_sid.as_str() == deleted_session_id.to_string().as_str() {
+                            finalize_active_generation(&handle, &store, &recs, &gen_coord);
                             let next_id = store
                                 .list_sessions(false)
                                 .first()
                                 .map(|m| m.id)
                                 .or_else(|| store.list_sessions(true).first().map(|m| m.id))
-                                .unwrap_or_else(|| {
-                                    store.create_session(None).expect("create fallback").id
-                                });
-                            load_session_into_ui(&handle, &store, &recs, next_id);
+                                .or_else(|| store.create_session(None).ok().map(|m| m.id));
+                            if let Some(nid) = next_id {
+                                load_session_into_ui(&handle, &store, &recs, nid);
+                            } else {
+                                eprintln!("[fugue-ui] Failed to create fallback session after deletion");
+                                refresh_session_list_ui(&handle, &store);
+                            }
                         } else {
                             refresh_session_list_ui(&handle, &store);
                         }
                     }
-                    ClientControlResponse::SessionCreatedOrUpdated { .. } => {
-                        refresh_session_list_ui(&handle, &store);
+                    ClientControlResponse::SessionCreatedOrUpdated { session } => {
+                        let cur_sid = handle.global::<AppState>().get_current_session_id();
+                        if session.archived && cur_sid.as_str() == session.id.to_string().as_str() {
+                            finalize_active_generation(&handle, &store, &recs, &gen_coord);
+                            let next_id = store
+                                .list_sessions(false)
+                                .first()
+                                .map(|m| m.id)
+                                .or_else(|| store.create_session(None).ok().map(|m| m.id));
+                            if let Some(nid) = next_id {
+                                load_session_into_ui(&handle, &store, &recs, nid);
+                            } else {
+                                refresh_session_list_ui(&handle, &store);
+                            }
+                        } else {
+                            refresh_session_list_ui(&handle, &store);
+                        }
+                    }
+                    ClientControlResponse::SearchResults { query, .. } => {
+                        handle
+                            .global::<AppState>()
+                            .set_session_search_query(SharedString::from(&query));
+                        refresh_search_hits_ui(&handle, &store, &query);
                     }
                     _ => {}
                 }
@@ -1545,12 +2293,30 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     load_session_into_ui(&app, &session_store, &records, active_sid);
 
-    // 6. Tokio background runtime
+    // 6. Tokio background runtime & async I/O worker
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .expect("Failed to initialize Tokio runtime");
+
+    let io_latest_gen = Arc::new(AtomicU64::new(0));
+    let io_handle = {
+        let app_weak = app.as_weak();
+        let latest_gen = io_latest_gen.clone();
+        AsyncIoHandle::spawn(rt.handle(), session_store.clone(), move |gen_id, _q, hits| {
+            let weak = app_weak.clone();
+            let lg = latest_gen.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if lg.load(Ordering::Acquire) != gen_id {
+                    return;
+                }
+                if let Some(handle) = weak.upgrade() {
+                    apply_search_hits_to_ui(&handle, hits);
+                }
+            });
+        })
+    };
 
     // 7. Connect UI Callbacks
     // 7.1 Copy to clipboard
@@ -1600,19 +2366,20 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // 7.1d Theme mode & Language persistence (`C:\Users\<Username>\.fugue\config.rkyv`)
     app.global::<AppState>().on_theme_mode_selected({
-        let store = session_store.clone();
+        let io = io_handle.clone();
         move |mode| {
             let pref = slint_to_theme_pref(mode);
-            let _ = store.update_config(|c| c.theme = pref);
+            io.send(IoCommand::UpdateThemeConfig { theme: pref });
         }
     });
 
     app.global::<AppState>().on_language_changed({
         let store = session_store.clone();
+        let io = io_handle.clone();
         let app_weak = app.as_weak();
         move |lang_str| {
             let pref = str_to_lang_pref(lang_str.as_str());
-            let _ = store.update_config(|c| c.lang = pref);
+            io.send(IoCommand::UpdateLanguageConfig { lang: pref });
             if let Some(handle) = app_weak.upgrade() {
                 refresh_session_list_ui(&handle, &store);
             }
@@ -1623,7 +2390,7 @@ fn main() -> Result<(), slint::PlatformError> {
     app.global::<AppState>().on_report_block_height({
         let app_weak = app.as_weak();
         move |flat_idx, measured_px| {
-            if measured_px <= 1.0 {
+            if !measured_px.is_finite() || measured_px <= 1.0 {
                 return;
             }
             let Some(handle) = app_weak.upgrade() else {
@@ -1639,6 +2406,13 @@ fn main() -> Result<(), slint::PlatformError> {
                 if (old_h - measured_px).abs() <= 0.5 {
                     return;
                 }
+                let old_slice = vp.fenwick.query_viewport(
+                    vp.scroll_y,
+                    vp.viewport_height,
+                    VIEWPORT_OVERSCAN_PX,
+                );
+                let block_top_y = vp.fenwick.offset_of(idx);
+                let delta = measured_px - old_h;
                 let key = (
                     vp.flat_blocks[idx].msg_index,
                     vp.flat_blocks[idx].block_id.clone(),
@@ -1646,14 +2420,34 @@ fn main() -> Result<(), slint::PlatformError> {
                 vp.measured_heights.insert(key, measured_px);
                 vp.fenwick.update_height(idx, measured_px);
 
+                // Scroll Anchoring: compensate scroll_y when a block above the viewport resizes
+                if block_top_y < vp.scroll_y && vp.scroll_y > 0.0 {
+                    let max_scroll = (vp.fenwick.total_height() - vp.viewport_height).max(0.0);
+                    let anchored = (vp.scroll_y + delta).clamp(0.0, max_scroll);
+                    let applied_delta = anchored - vp.scroll_y;
+                    vp.scroll_y = anchored;
+                    if applied_delta.abs() > 0.01 {
+                        LENIS_STATE.with(|lcell| {
+                            let mut mgr = lcell.borrow_mut();
+                            mgr.chat.current += applied_delta as f64;
+                            mgr.chat.target += applied_delta as f64;
+                        });
+                        handle.invoke_set_chat_scroll_y(anchored);
+                    }
+                }
+
                 let slice = vp.fenwick.query_viewport(
                     vp.scroll_y,
                     vp.viewport_height,
                     VIEWPORT_OVERSCAN_PX,
                 );
-                let state = handle.global::<AppState>();
-                state.set_top_spacer_height(slice.top_spacer_height);
-                state.set_bottom_spacer_height(slice.bottom_spacer_height);
+                if slice.start_idx != old_slice.start_idx || slice.end_idx != old_slice.end_idx {
+                    apply_viewport_slice(&handle, &mut vp);
+                } else {
+                    let state = handle.global::<AppState>();
+                    state.set_top_spacer_height(slice.top_spacer_height);
+                    state.set_bottom_spacer_height(slice.bottom_spacer_height);
+                }
             });
         }
     });
@@ -1675,12 +2469,43 @@ fn main() -> Result<(), slint::PlatformError> {
                 );
                 vp.scroll_y = scroll_y.max(0.0);
                 vp.viewport_height = viewport_h.max(100.0);
+                vp.viewport_width = viewport_w.max(200.0);
 
-                // Fix M4: dynamic inline wrap column budget from viewport width
-                let computed_cols = ((viewport_w - 40.0) / 8.2).clamp(28.0, 104.0) as usize;
+                // Fix M4: dynamic inline wrap column budget from clamped viewport width
+                let computed_cols = ((vp.viewport_width - 40.0) / 8.2).clamp(28.0, 104.0) as usize;
                 let cols_changed = computed_cols.abs_diff(vp.max_cols) >= 3;
                 if cols_changed {
                     vp.max_cols = computed_cols;
+                    // Invalidate width-dependent offscreen measured heights & frozen cache
+                    let len = vp.flat_blocks.len();
+                    for i in 0..len {
+                        let is_width_dependent = if vp.flat_blocks[i].is_user {
+                            true
+                        } else if let Some(ref sb) = vp.flat_blocks[i].source_block {
+                            !matches!(
+                                sb.kind,
+                                BlockKind::CodeBlock { .. }
+                                    | BlockKind::LatexMath { .. }
+                                    | BlockKind::ThematicBreak
+                            )
+                        } else {
+                            false
+                        };
+                        if is_width_dependent {
+                            let key = (
+                                vp.flat_blocks[i].msg_index,
+                                vp.flat_blocks[i].block_id.clone(),
+                            );
+                            vp.measured_heights.remove(&key);
+                            vp.frozen_cache.remove(&key);
+                            if let Some(ref sb) = vp.flat_blocks[i].source_block {
+                                let (est_h, _, _) = estimate_stream_block_height(sb, computed_cols);
+                                if i < vp.fenwick.len() {
+                                    vp.fenwick.update_height(i, est_h);
+                                }
+                            }
+                        }
+                    }
                 }
 
                 let new_slice = vp.fenwick.query_viewport(
@@ -1693,6 +2518,44 @@ fn main() -> Result<(), slint::PlatformError> {
                     || old_slice.end_idx != new_slice.end_idx
                 {
                     apply_viewport_slice(&handle, &mut vp);
+                }
+            });
+        }
+    });
+
+    app.global::<AppState>().on_code_block_scrolled({
+        let app_weak = app.as_weak();
+        move |flat_idx, scroll_x_px| {
+            let Some(handle) = app_weak.upgrade() else {
+                return;
+            };
+            let idx = flat_idx.max(0) as usize;
+            UI_VIEWPORT_STATE.with(|cell| {
+                let mut vp = cell.borrow_mut();
+                let sx = scroll_x_px.max(0.0);
+                vp.code_scroll_x.insert(idx, sx);
+                if is_block_touched_by_selection(vp.text_selection, idx) {
+                    refresh_selection_overlays(&handle, &mut vp);
+                }
+            });
+        }
+    });
+
+    app.global::<AppState>().on_code_wrap_changed({
+        let app_weak = app.as_weak();
+        move |flat_idx, wrap_enabled| {
+            let Some(handle) = app_weak.upgrade() else {
+                return;
+            };
+            let idx = flat_idx.max(0) as usize;
+            UI_VIEWPORT_STATE.with(|cell| {
+                let mut vp = cell.borrow_mut();
+                vp.code_wrap_states.insert(idx, wrap_enabled);
+                if wrap_enabled {
+                    vp.code_scroll_x.remove(&idx);
+                }
+                if is_block_touched_by_selection(vp.text_selection, idx) {
+                    refresh_selection_overlays(&handle, &mut vp);
                 }
             });
         }
@@ -1722,7 +2585,8 @@ fn main() -> Result<(), slint::PlatformError> {
                 let state = handle.global::<AppState>();
                 if delta_y_px > 0.0 {
                     state.set_auto_scroll_sticky(false);
-                } else if delta_y_px < 0.0 && mgr.chat.target >= (max_scroll_px as f64 - 36.0).max(0.0)
+                } else if delta_y_px < 0.0
+                    && mgr.chat.current >= (max_scroll_px as f64 - 36.0).max(0.0)
                 {
                     state.set_auto_scroll_sticky(true);
                 }
@@ -1733,6 +2597,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
     app.global::<AppState>().on_lenis_sync_chat({
         move |direct_pos_px, max_scroll_px| {
+            LAST_SENT_CHAT_Y.with(|last| last.set(direct_pos_px.max(0.0)));
             LENIS_STATE.with(|cell| {
                 cell.borrow_mut()
                     .chat
@@ -1806,12 +2671,12 @@ fn main() -> Result<(), slint::PlatformError> {
         let app_weak = app.as_weak();
         let store = session_store.clone();
         let records = records.clone();
-        let stop_signal = stop_signal.clone();
+        let gen_coord = gen_coord.clone();
         move || {
             let Some(handle) = app_weak.upgrade() else {
                 return;
             };
-            finalize_active_generation(&handle, &store, &records, &stop_signal);
+            finalize_active_generation(&handle, &store, &records, &gen_coord);
             handle.global::<AppState>().set_show_archived_sessions(false);
             if let Ok(meta) = store.create_session(None) {
                 load_session_into_ui(&handle, &store, &records, meta.id);
@@ -1823,7 +2688,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let app_weak = app.as_weak();
         let store = session_store.clone();
         let records = records.clone();
-        let stop_signal = stop_signal.clone();
+        let gen_coord = gen_coord.clone();
         move |sid_str| {
             let Some(handle) = app_weak.upgrade() else {
                 return;
@@ -1834,7 +2699,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let Ok(sid) = UuidV7::parse_str(sid_str.as_str()) else {
                 return;
             };
-            finalize_active_generation(&handle, &store, &records, &stop_signal);
+            finalize_active_generation(&handle, &store, &records, &gen_coord);
             load_session_into_ui(&handle, &store, &records, sid);
         }
     });
@@ -1843,7 +2708,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let app_weak = app.as_weak();
         let store = session_store.clone();
         let records = records.clone();
-        let stop_signal = stop_signal.clone();
+        let gen_coord = gen_coord.clone();
         move |sid_str| {
             let Some(handle) = app_weak.upgrade() else {
                 return;
@@ -1851,7 +2716,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let Ok(sid) = UuidV7::parse_str(sid_str.as_str()) else {
                 return;
             };
-            finalize_active_generation(&handle, &store, &records, &stop_signal);
+            finalize_active_generation(&handle, &store, &records, &gen_coord);
             if let Ok(child_meta) = store.clone_session(sid, None) {
                 handle.global::<AppState>().set_show_archived_sessions(false);
                 load_session_into_ui(&handle, &store, &records, child_meta.id);
@@ -1895,7 +2760,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let app_weak = app.as_weak();
         let store = session_store.clone();
         let records = records.clone();
-        let stop_signal = stop_signal.clone();
+        let gen_coord = gen_coord.clone();
         move |sid_str, new_archived| {
             let Some(handle) = app_weak.upgrade() else {
                 return;
@@ -1906,18 +2771,18 @@ fn main() -> Result<(), slint::PlatformError> {
             if store.set_session_archived(sid, new_archived).is_ok() {
                 let state = handle.global::<AppState>();
                 if new_archived && state.get_current_session_id() == sid_str {
-                    finalize_active_generation(&handle, &store, &records, &stop_signal);
+                    finalize_active_generation(&handle, &store, &records, &gen_coord);
                     let next_id = store
                         .list_sessions(false)
                         .first()
                         .map(|m| m.id)
-                        .unwrap_or_else(|| {
-                            store
-                                .create_session(None)
-                                .expect("create fallback session")
-                                .id
-                        });
-                    load_session_into_ui(&handle, &store, &records, next_id);
+                        .or_else(|| store.create_session(None).ok().map(|m| m.id));
+                    if let Some(nid) = next_id {
+                        load_session_into_ui(&handle, &store, &records, nid);
+                    } else {
+                        eprintln!("[fugue-ui] Failed to create fallback session after archive");
+                        refresh_session_list_ui(&handle, &store);
+                    }
                 } else {
                     refresh_session_list_ui(&handle, &store);
                 }
@@ -1929,7 +2794,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let app_weak = app.as_weak();
         let store = session_store.clone();
         let records = records.clone();
-        let stop_signal = stop_signal.clone();
+        let gen_coord = gen_coord.clone();
         move |sid_str| {
             let Some(handle) = app_weak.upgrade() else {
                 return;
@@ -1939,7 +2804,7 @@ fn main() -> Result<(), slint::PlatformError> {
             };
             let deleting_current = handle.global::<AppState>().get_current_session_id() == sid_str;
             if deleting_current {
-                finalize_active_generation(&handle, &store, &records, &stop_signal);
+                finalize_active_generation(&handle, &store, &records, &gen_coord);
             }
             if store.delete_session(sid).is_ok() {
                 if deleting_current {
@@ -1949,16 +2814,18 @@ fn main() -> Result<(), slint::PlatformError> {
                         .first()
                         .map(|m| m.id)
                         .or_else(|| store.list_sessions(false).first().map(|m| m.id))
-                        .unwrap_or_else(|| {
+                        .or_else(|| {
                             handle
                                 .global::<AppState>()
                                 .set_show_archived_sessions(false);
-                            store
-                                .create_session(None)
-                                .expect("create fallback session")
-                                .id
+                            store.create_session(None).ok().map(|m| m.id)
                         });
-                    load_session_into_ui(&handle, &store, &records, next_id);
+                    if let Some(nid) = next_id {
+                        load_session_into_ui(&handle, &store, &records, nid);
+                    } else {
+                        eprintln!("[fugue-ui] Failed to create fallback session after delete");
+                        refresh_session_list_ui(&handle, &store);
+                    }
                 } else {
                     refresh_session_list_ui(&handle, &store);
                 }
@@ -1982,12 +2849,20 @@ fn main() -> Result<(), slint::PlatformError> {
 
     app.global::<AppState>().on_search_sessions_query({
         let app_weak = app.as_weak();
-        let store = session_store.clone();
+        let io = io_handle.clone();
+        let latest_gen = io_latest_gen.clone();
         move |query| {
             let Some(handle) = app_weak.upgrade() else {
                 return;
             };
-            refresh_search_hits_ui(&handle, &store, query.as_str());
+            let q = query.to_string();
+            let gen_id = io.request_search(q.clone());
+            latest_gen.store(gen_id, Ordering::Release);
+            if q.trim().is_empty() {
+                handle
+                    .global::<AppState>()
+                    .set_search_hits(ModelRc::default());
+            }
         }
     });
 
@@ -1995,7 +2870,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let app_weak = app.as_weak();
         let store = session_store.clone();
         let records = records.clone();
-        let stop_signal = stop_signal.clone();
+        let gen_coord = gen_coord.clone();
         move |sid_str, mid_str, msg_idx_hint| {
             let Some(handle) = app_weak.upgrade() else {
                 return;
@@ -2006,7 +2881,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let target_mid = UuidV7::parse_str(mid_str.as_str()).ok();
 
             if handle.global::<AppState>().get_current_session_id() != sid_str {
-                finalize_active_generation(&handle, &store, &records, &stop_signal);
+                finalize_active_generation(&handle, &store, &records, &gen_coord);
                 load_session_into_ui(&handle, &store, &records, sid);
             }
 
@@ -2018,10 +2893,9 @@ fn main() -> Result<(), slint::PlatformError> {
                     .unwrap_or_else(|| (msg_idx_hint.max(0) as usize).min(recs.len().saturating_sub(1)))
             };
 
-            // Compute exact vertical pixel offset via Fenwick tree prefix sum and highlight target message blocks
+            // Compute exact vertical pixel offset via Fenwick tree prefix sum and highlight target message
             let scroll_target = UI_VIEWPORT_STATE.with(|cell| {
                 let mut vp = cell.borrow_mut();
-                vp.selected_indices.clear();
                 let matching_flats: Vec<usize> = vp
                     .flat_blocks
                     .iter()
@@ -2029,8 +2903,17 @@ fn main() -> Result<(), slint::PlatformError> {
                     .map(|b| b.flat_index)
                     .collect();
                 let first_flat = matching_flats.first().copied();
-                for f_idx in matching_flats {
-                    vp.selected_indices.insert(f_idx);
+                let last_flat = matching_flats.last().copied();
+                if let (Some(f), Some(l)) = (first_flat, last_flat) {
+                    if let Some(last_geom) = get_or_compile_geometry(l, &mut vp) {
+                        let (_, end_pos) = expand_block_range(l, &last_geom);
+                        vp.text_selection = Some(TextSelection {
+                            anchor: TextPos::new(f, 0, 0),
+                            focus: end_pos,
+                        });
+                    }
+                } else {
+                    vp.text_selection = None;
                 }
                 let target_y = first_flat
                     .map(|f_idx| vp.fenwick.offset_of(f_idx).max(0.0))
@@ -2054,88 +2937,168 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
-    // 7.3 Left-click / drag block selection (`agent-block-copy.ts` parity)
-    app.global::<AppState>().on_block_left_pressed({
+    // 7.3 Global Chrome-style Character-Level Selection Engine
+    fn hit_test_viewport_point(vp: &mut UiViewportState, vx: f32, vy: f32) -> Option<TextPos> {
+        let doc_y = (vy + vp.scroll_y).max(0.0);
+        let (flat_idx, block_top_y) = vp.fenwick.find_index_at_y(doc_y)?;
+        let geom = get_or_compile_geometry(flat_idx, vp)?;
+        Some(hit_test_block(flat_idx, &geom, vx, doc_y - block_top_y))
+    }
+
+    app.global::<AppState>().on_chat_pointer_down({
         let app_weak = app.as_weak();
 
-        move |flat_idx, shift, ctrl| {
+        move |vx, vy, button, shift, _ctrl| {
             let Some(handle) = app_weak.upgrade() else {
                 return;
             };
-            let idx = flat_idx.max(0) as usize;
             UI_VIEWPORT_STATE.with(|cell| {
                 let mut vp = cell.borrow_mut();
+                if button == 1 {
+                    let doc_y = (vy + vp.scroll_y).max(0.0);
+                    if let Some((flat_idx, _)) = vp.fenwick.find_index_at_y(doc_y) {
+                        if let Some((msg_index, is_table)) = vp
+                            .flat_blocks
+                            .get(flat_idx)
+                            .map(|e| (e.msg_index, e.is_table))
+                        {
+                            vp.context_target_flat = Some(flat_idx);
+                            vp.context_target_msg = Some(msg_index);
+                            handle.global::<AppState>().set_context_menu_is_table(is_table);
+                            handle.global::<AppState>().set_context_menu_open(true);
+                        }
+                    }
+                    return;
+                }
+
+                let Some(pos) = hit_test_viewport_point(&mut vp, vx, vy) else {
+                    vp.text_selection = None;
+                    refresh_selection_overlays(&handle, &mut vp);
+                    return;
+                };
+
+                let click_count = vp.drag_gesture.register_press(vx, vy);
                 if shift {
-                    let anchor = vp.selection_anchor.unwrap_or(idx);
-                    let start = anchor.min(idx);
-                    let end = anchor.max(idx);
-                    vp.selected_indices.clear();
-                    for i in start..=end {
-                        vp.selected_indices.insert(i);
+                    let anchor = vp.text_selection.map(|s| s.anchor).unwrap_or(pos);
+                    vp.text_selection = Some(TextSelection { anchor, focus: pos });
+                } else if click_count == 2 {
+                    if let Some(geom) = get_or_compile_geometry(pos.flat_index, &mut vp) {
+                        let (s, e) = expand_word_at(&geom, pos);
+                        vp.text_selection = Some(TextSelection { anchor: s, focus: e });
                     }
-                } else if ctrl {
-                    if vp.selected_indices.contains(&idx) {
-                        vp.selected_indices.remove(&idx);
-                    } else {
-                        vp.selected_indices.insert(idx);
+                } else if click_count == 3 {
+                    if let Some(geom) = get_or_compile_geometry(pos.flat_index, &mut vp) {
+                        let (s, e) = expand_block_range(pos.flat_index, &geom);
+                        vp.text_selection = Some(TextSelection { anchor: s, focus: e });
                     }
-                    vp.selection_anchor = Some(idx);
                 } else {
-                    vp.selected_indices.clear();
-                    vp.selected_indices.insert(idx);
-                    vp.selection_anchor = Some(idx);
+                    vp.text_selection = Some(TextSelection {
+                        anchor: pos,
+                        focus: pos,
+                    });
+                }
+                refresh_selection_overlays(&handle, &mut vp);
+            });
+        }
+    });
+
+    app.global::<AppState>().on_chat_pointer_move({
+        let app_weak = app.as_weak();
+
+        move |vx, vy, pressed| {
+            let Some(handle) = app_weak.upgrade() else {
+                return;
+            };
+            if !pressed {
+                return;
+            }
+            UI_VIEWPORT_STATE.with(|cell| {
+                let mut vp = cell.borrow_mut();
+                if !vp.drag_gesture.update_move(vx, vy) {
+                    return;
+                }
+                if let Some(pos) = hit_test_viewport_point(&mut vp, vx, vy) {
+                    let anchor = vp.text_selection.map(|s| s.anchor).unwrap_or(pos);
+                    if vp.text_selection.map(|s| s.focus) != Some(pos) {
+                        vp.text_selection = Some(TextSelection { anchor, focus: pos });
+                        refresh_selection_overlays(&handle, &mut vp);
+                    }
+                }
+            });
+        }
+    });
+
+    app.global::<AppState>().on_chat_pointer_up({
+        let app_weak = app.as_weak();
+
+        move |_vx, _vy, _button| {
+            let Some(_handle) = app_weak.upgrade() else {
+                return;
+            };
+            UI_VIEWPORT_STATE.with(|cell| {
+                cell.borrow_mut().drag_gesture.release();
+            });
+        }
+    });
+
+    // 7.4 16ms Timer-driven Edge Auto-Scroll (works even when pointer is stationary)
+    app.global::<AppState>().on_selection_auto_scroll_tick({
+        let app_weak = app.as_weak();
+
+        move |vy| {
+            let Some(handle) = app_weak.upgrade() else {
+                return;
+            };
+            UI_VIEWPORT_STATE.with(|cell| {
+                let mut vp = cell.borrow_mut();
+                if !vp.drag_gesture.is_dragging {
+                    return;
+                }
+                let vh = vp.viewport_height;
+                let max_scroll = (vp.fenwick.total_height() - vh).max(0.0);
+                if max_scroll <= 0.0 {
+                    return;
+                }
+
+                let edge = 36.0f32;
+                let step = if vy < edge && vp.scroll_y > 0.0 {
+                    -((edge - vy).clamp(2.0, 28.0) * 0.65)
+                } else if vy > vh - edge && vp.scroll_y < max_scroll {
+                    (vy - (vh - edge)).clamp(2.0, 28.0) * 0.65
+                } else {
+                    0.0
+                };
+
+                if step.abs() <= 0.01 {
+                    return;
+                }
+
+                let next_scroll = (vp.scroll_y + step).clamp(0.0, max_scroll);
+                if (next_scroll - vp.scroll_y).abs() <= 0.01 {
+                    return;
+                }
+
+                if step < 0.0 {
+                    handle.global::<AppState>().set_auto_scroll_sticky(false);
+                }
+                vp.scroll_y = next_scroll;
+                LENIS_STATE.with(|lcell| {
+                    let mut mgr = lcell.borrow_mut();
+                    mgr.chat.jump_to(next_scroll as f64, max_scroll as f64);
+                });
+                handle.invoke_set_chat_scroll_y(next_scroll);
+
+                let vx = vp.drag_gesture.last_viewport_x;
+                if let Some(pos) = hit_test_viewport_point(&mut vp, vx, vy) {
+                    let anchor = vp.text_selection.map(|s| s.anchor).unwrap_or(pos);
+                    vp.text_selection = Some(TextSelection { anchor, focus: pos });
                 }
                 apply_viewport_slice(&handle, &mut vp);
             });
         }
     });
 
-    app.global::<AppState>().on_block_hover_drag({
-        let app_weak = app.as_weak();
-
-        move |flat_idx| {
-            let Some(handle) = app_weak.upgrade() else {
-                return;
-            };
-            let idx = flat_idx.max(0) as usize;
-            UI_VIEWPORT_STATE.with(|cell| {
-                let mut vp = cell.borrow_mut();
-                let anchor = vp.selection_anchor.unwrap_or(idx);
-                let start = anchor.min(idx);
-                let end = anchor.max(idx);
-                let new_range: BTreeSet<usize> = (start..=end).collect();
-                if vp.selected_indices != new_range {
-                    vp.selected_indices = new_range;
-                    apply_viewport_slice(&handle, &mut vp);
-                }
-            });
-        }
-    });
-
-    // 7.4 Right-click opens Singleton Context Menu without mutating selection
-    app.global::<AppState>().on_block_right_clicked({
-        let app_weak = app.as_weak();
-
-        move |flat_idx, msg_idx, is_table, win_x, win_y| {
-            let Some(handle) = app_weak.upgrade() else {
-                return;
-            };
-            let f_idx = flat_idx.max(0) as usize;
-            let m_idx = msg_idx.max(0) as usize;
-            UI_VIEWPORT_STATE.with(|cell| {
-                let mut vp = cell.borrow_mut();
-                vp.context_target_flat = Some(f_idx);
-                vp.context_target_msg = Some(m_idx);
-            });
-            let state = handle.global::<AppState>();
-            state.set_context_menu_is_table(is_table);
-            state.set_context_menu_x(win_x);
-            state.set_context_menu_y(win_y);
-            state.set_context_menu_open(true);
-        }
-    });
-
-    // 7.5 Singleton Context Menu Action Dispatch (Lazy Serialization on Click)
+    // 7.5 Singleton Context Menu Action Dispatch (Unified Character Range)
     app.global::<AppState>().on_context_menu_action({
         let app_weak = app.as_weak();
 
@@ -2148,7 +3111,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 let mut vp = cell.borrow_mut();
                 match act {
                     "copy_plain" | "copy_markdown" | "copy_tsv" => {
-                        let payload = serialize_blocks_for_clipboard(&vp, act);
+                        let payload = serialize_blocks_for_clipboard(&mut vp, act);
                         if !payload.is_empty() {
                             if let Ok(mut clipboard) = arboard::Clipboard::new() {
                                 let _ = clipboard.set_text(payload);
@@ -2157,39 +3120,108 @@ fn main() -> Result<(), slint::PlatformError> {
                     }
                     "select_block" => {
                         if let Some(target) = vp.context_target_flat {
-                            vp.selected_indices.clear();
-                            vp.selected_indices.insert(target);
-                            vp.selection_anchor = Some(target);
-                            apply_viewport_slice(&handle, &mut vp);
+                            if let Some(geom) = get_or_compile_geometry(target, &mut vp) {
+                                let (s, e) = expand_block_range(target, &geom);
+                                vp.text_selection = Some(TextSelection { anchor: s, focus: e });
+                                refresh_selection_overlays(&handle, &mut vp);
+                            }
                         }
                     }
                     "select_message" => {
                         if let Some(target_msg) = vp.context_target_msg {
-                            vp.selected_indices.clear();
                             let matching: Vec<usize> = vp
                                 .flat_blocks
                                 .iter()
                                 .filter(|b| b.msg_index == target_msg)
                                 .map(|b| b.flat_index)
                                 .collect();
-                            for idx in matching {
-                                vp.selected_indices.insert(idx);
+                            if let (Some(&f), Some(&l)) = (matching.first(), matching.last()) {
+                                if let Some(last_geom) = get_or_compile_geometry(l, &mut vp) {
+                                    let (_, end_pos) = expand_block_range(l, &last_geom);
+                                    vp.text_selection = Some(TextSelection {
+                                        anchor: TextPos::new(f, 0, 0),
+                                        focus: end_pos,
+                                    });
+                                    refresh_selection_overlays(&handle, &mut vp);
+                                }
                             }
-                            apply_viewport_slice(&handle, &mut vp);
                         }
                     }
                     "select_all" => {
-                        vp.selected_indices = (0..vp.flat_blocks.len()).collect();
-                        apply_viewport_slice(&handle, &mut vp);
+                        let len = vp.flat_blocks.len();
+                        if len > 0 {
+                            let last = len - 1;
+                            if let Some(last_geom) = get_or_compile_geometry(last, &mut vp) {
+                                let (_, end_pos) = expand_block_range(last, &last_geom);
+                                vp.text_selection = Some(TextSelection {
+                                    anchor: TextPos::new(0, 0, 0),
+                                    focus: end_pos,
+                                });
+                                refresh_selection_overlays(&handle, &mut vp);
+                            }
+                        }
                     }
                     "clear_selection" => {
-                        vp.selected_indices.clear();
-                        vp.selection_anchor = None;
-                        apply_viewport_slice(&handle, &mut vp);
+                        vp.text_selection = None;
+                        refresh_selection_overlays(&handle, &mut vp);
                     }
                     _ => {}
                 }
             });
+        }
+    });
+
+    // 7.6b Safe External URL Opening & Task Checkbox Toggle
+    app.global::<AppState>().on_open_external_url(|url| {
+        if !open_external_url_safe(url.as_str()) {
+            // Fallback to clipboard when scheme is unsupported
+            if let Ok(mut cb) = arboard::Clipboard::new() {
+                let _ = cb.set_text(url.to_string());
+            }
+        }
+    });
+
+    app.global::<AppState>().on_toggle_task_checkbox({
+        let records = records.clone();
+        let app_weak = app.as_weak();
+        move |flat_idx, item_idx| {
+            let Some(handle) = app_weak.upgrade() else {
+                return;
+            };
+            let idx = flat_idx.max(0) as usize;
+            let item_u = item_idx.max(0) as usize;
+            let target = UI_VIEWPORT_STATE.with(|cell| {
+                let vp = cell.borrow();
+                vp.flat_blocks
+                    .get(idx)
+                    .map(|b| (b.msg_index, b.block_id.clone(), b.raw_markdown.clone()))
+            });
+            let Some((msg_idx, block_id, old_md)) = target else {
+                return;
+            };
+            let Some(new_md) = toggle_task_checkbox_in_markdown(&old_md, item_u) else {
+                return;
+            };
+            {
+                let mut recs = records.write();
+                if let Some(rec) = recs.get_mut(msg_idx) {
+                    if let Some(pos) = rec.accumulated_content.find(&old_md) {
+                        rec.accumulated_content
+                            .replace_range(pos..pos + old_md.len(), &new_md);
+                        let mut auto = StreamBlockAutomaton::new();
+                        auto.advance(&rec.accumulated_content, !rec.is_streaming);
+                        *rec.automaton.write() = auto;
+                    }
+                }
+                UI_VIEWPORT_STATE.with(|cell| {
+                    let mut vp = cell.borrow_mut();
+                    vp.frozen_cache.remove(&(msg_idx, block_id.clone()));
+                    vp.measured_heights.remove(&(msg_idx, block_id));
+                    vp.synced_msg_count = 0;
+                });
+                let is_dark = handle.global::<Theme>().get_dark();
+                sync_and_cull_ui(&handle, &recs, is_dark);
+            }
         }
     });
 
@@ -2241,14 +3273,14 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // 7.7 Stop generation: immediately finalize active tail into closed blocks & persist to sandbox
     app.global::<AppState>().on_stop_generation({
-        let stop_signal = stop_signal.clone();
+        let gen_coord = gen_coord.clone();
         let records = records.clone();
         let store = session_store.clone();
         let app_weak = app.as_weak();
 
         move || {
             if let Some(handle) = app_weak.upgrade() {
-                finalize_active_generation(&handle, &store, &records, &stop_signal);
+                finalize_active_generation(&handle, &store, &records, &gen_coord);
                 {
                     let recs = records.read();
                     let is_dark = handle.global::<Theme>().get_dark();
@@ -2262,7 +3294,7 @@ fn main() -> Result<(), slint::PlatformError> {
     // 7.8 Send message with 16ms RAF-equivalent streaming batcher & zero-copy sandbox persistence
     app.global::<AppState>().on_send_message({
         let records = records.clone();
-        let stop_signal = stop_signal.clone();
+        let gen_coord = gen_coord.clone();
         let app_weak = app.as_weak();
         let omni = omni.clone();
         let store = session_store.clone();
@@ -2278,21 +3310,29 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(handle) = app_weak.upgrade() else {
                 return;
             };
+            if handle.global::<AppState>().get_is_generating() {
+                return;
+            }
             let is_dark = handle.global::<Theme>().get_dark();
 
             // Resolve active session ID (or create a session if none exists)
-            let active_sid = UuidV7::parse_str(
+            let active_sid = match UuidV7::parse_str(
                 handle.global::<AppState>().get_current_session_id().as_str(),
-            )
-            .unwrap_or_else(|_| {
-                let meta = store
-                    .create_session(None)
-                    .expect("Failed to create session");
-                handle
-                    .global::<AppState>()
-                    .set_current_session_id(SharedString::from(meta.id.to_string()));
-                meta.id
-            });
+            ) {
+                Ok(id) => id,
+                Err(_) => match store.create_session(None) {
+                    Ok(meta) => {
+                        handle
+                            .global::<AppState>()
+                            .set_current_session_id(SharedString::from(meta.id.to_string()));
+                        meta.id
+                    }
+                    Err(e) => {
+                        eprintln!("[fugue-ui] Failed to create session on send: {}", e);
+                        return;
+                    }
+                },
+            };
 
             // Immediately persist user message into the isolated session sandbox
             let user_msg_id = store
@@ -2302,16 +3342,10 @@ fn main() -> Result<(), slint::PlatformError> {
 
             refresh_session_list_ui(&handle, &store);
 
+            // Preserve user's active historical text selection across streaming turns
+            let (my_gen_id, mut cancel_rx) = gen_coord.begin_generation();
             handle.global::<AppState>().set_has_messages(true);
             handle.global::<AppState>().set_is_generating(true);
-            stop_signal.store(false, Ordering::SeqCst);
-
-            // Clear stale selection on new message turn (Fix X6)
-            UI_VIEWPORT_STATE.with(|cell| {
-                let mut vp = cell.borrow_mut();
-                vp.selected_indices.clear();
-                vp.selection_anchor = None;
-            });
 
             // Fix F6 & F7: single `accumulated_content` field + build prompt payloads under read lock without cloning records
             let prompt_messages = {
@@ -2352,18 +3386,22 @@ fn main() -> Result<(), slint::PlatformError> {
 
             let records_clone = records.clone();
             let app_weak_clone = app_weak.clone();
-            let stop_signal_clone = stop_signal.clone();
+            let gen_coord_clone = gen_coord.clone();
             let omni_clone = omni.clone();
             let store_clone = store.clone();
             let gateway_clone = gateway.clone();
             let turn_session_id = active_sid;
 
-            rt_handle.spawn(async move {
+            let outer_handle = rt_handle.spawn(async move {
                 let config = match DeepSeekConfig::load_from_env() {
                     Ok(c) => c,
                     Err(e) => {
                         let store_err = store_clone.clone();
+                        let gen_check = gen_coord_clone.clone();
                         let _ = slint::invoke_from_event_loop(move || {
+                            if !gen_check.is_current(my_gen_id) {
+                                return;
+                            }
                             if let Some(h) = app_weak_clone.upgrade() {
                                 h.global::<AppState>().set_is_generating(false);
                                 {
@@ -2391,33 +3429,99 @@ fn main() -> Result<(), slint::PlatformError> {
                 let client = DeepSeekClient::new();
                 let (tx, mut rx) = tokio::sync::mpsc::channel(128);
 
-                let stop_sub = stop_signal_clone.clone();
-                tokio::spawn(async move {
+                let stream_cancel = cancel_rx.clone();
+                let stream_handle = tokio::spawn(async move {
                     client
-                        .stream_chat(&config, prompt_messages, stop_sub, tx)
+                        .stream_chat(&config, prompt_messages, stream_cancel, tx)
                         .await;
                 });
+                gen_coord_clone.register_task(my_gen_id, stream_handle.abort_handle());
 
                 // 16ms frame-throttled streaming batcher (`session-update-batcher` equivalent)
                 let mut pending_delta = String::new();
-                let mut last_flush = Instant::now();
+                let mut flush_deadline: Option<tokio::time::Instant> = None;
                 let frame_interval = Duration::from_millis(16);
+                let mut finished = false;
 
-                while let Some(event) = rx.recv().await {
+                loop {
+                    if !gen_coord_clone.is_current(my_gen_id) || *cancel_rx.borrow() {
+                        if !pending_delta.is_empty() {
+                            let tail_chunk = std::mem::take(&mut pending_delta);
+                            let mut recs = records_clone.write();
+                            if let Some(last) = recs.last_mut() {
+                                last.accumulated_content.push_str(&tail_chunk);
+                            }
+                        }
+                        finished = true;
+                        break;
+                    }
+
+                    let next_event: Option<StreamEvent> = tokio::select! {
+                        biased;
+                        _ = cancel_rx.changed() => {
+                            if !pending_delta.is_empty() {
+                                let tail_chunk = std::mem::take(&mut pending_delta);
+                                let mut recs = records_clone.write();
+                                if let Some(last) = recs.last_mut() {
+                                    last.accumulated_content.push_str(&tail_chunk);
+                                }
+                            }
+                            finished = true;
+                            break;
+                        }
+                        _ = async {
+                            if let Some(dl) = flush_deadline {
+                                tokio::time::sleep_until(dl).await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        }, if flush_deadline.is_some() => {
+                            flush_deadline = None;
+                            if !pending_delta.is_empty() && gen_coord_clone.is_current(my_gen_id) {
+                                let chunk = std::mem::take(&mut pending_delta);
+                                let recs_lock = records_clone.clone();
+                                let weak_app = app_weak_clone.clone();
+                                let gen_check = gen_coord_clone.clone();
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    if !gen_check.is_current(my_gen_id) {
+                                        return;
+                                    }
+                                    if let Some(h) = weak_app.upgrade() {
+                                        let mut recs = recs_lock.write();
+                                        if let Some(last) = recs.last_mut() {
+                                            last.accumulated_content.push_str(&chunk);
+                                        }
+                                        let is_dark = h.global::<Theme>().get_dark();
+                                        sync_and_cull_ui(&h, &recs, is_dark);
+                                        h.invoke_scroll_to_bottom_if_sticky();
+                                    }
+                                });
+                            }
+                            continue;
+                        }
+                        ev = rx.recv() => ev,
+                    };
+
+                    let Some(event) = next_event else {
+                        break;
+                    };
+
                     match event {
                         StreamEvent::ContentDelta(delta) => {
                             pending_delta.push_str(&delta);
-                            while let Ok(StreamEvent::ContentDelta(more)) = rx.try_recv() {
-                                pending_delta.push_str(&more);
-                            }
-
-                            if last_flush.elapsed() >= frame_interval {
+                            let now = tokio::time::Instant::now();
+                            let dl = *flush_deadline.get_or_insert(now + frame_interval);
+                            if now >= dl {
+                                flush_deadline = None;
                                 let chunk = std::mem::take(&mut pending_delta);
-                                last_flush = Instant::now();
                                 let recs_lock = records_clone.clone();
                                 let weak_app = app_weak_clone.clone();
+                                let gen_check = gen_coord_clone.clone();
 
                                 let _ = slint::invoke_from_event_loop(move || {
+                                    if !gen_check.is_current(my_gen_id) {
+                                        return;
+                                    }
                                     if let Some(h) = weak_app.upgrade() {
                                         let mut recs = recs_lock.write();
                                         if let Some(last) = recs.last_mut() {
@@ -2434,11 +3538,13 @@ fn main() -> Result<(), slint::PlatformError> {
                             name,
                             arguments_json,
                         } => {
+                            flush_deadline = None;
                             let flushed_chunk = std::mem::take(&mut pending_delta);
                             let recs_lock = records_clone.clone();
                             let weak_app = app_weak_clone.clone();
                             let omni = omni_clone.clone();
                             let gw = gateway_clone.clone();
+                            let gen_check = gen_coord_clone.clone();
 
                             let (summary, detail) =
                                 if ClientControlCommand::from_tool_call(&name, &arguments_json)
@@ -2478,6 +3584,9 @@ fn main() -> Result<(), slint::PlatformError> {
                                 };
 
                             let _ = slint::invoke_from_event_loop(move || {
+                                if !gen_check.is_current(my_gen_id) {
+                                    return;
+                                }
                                 if let Some(h) = weak_app.upgrade() {
                                     let mut recs = recs_lock.write();
                                     if let Some(last) = recs.last_mut() {
@@ -2493,12 +3602,17 @@ fn main() -> Result<(), slint::PlatformError> {
                             });
                         }
                         StreamEvent::Done => {
+                            finished = true;
                             let flushed_chunk = std::mem::take(&mut pending_delta);
                             let recs_lock = records_clone.clone();
                             let weak_app = app_weak_clone.clone();
                             let store_done = store_clone.clone();
+                            let gen_check = gen_coord_clone.clone();
 
                             let _ = slint::invoke_from_event_loop(move || {
+                                if !gen_check.is_current(my_gen_id) {
+                                    return;
+                                }
                                 if let Some(h) = weak_app.upgrade() {
                                     h.global::<AppState>().set_is_generating(false);
                                     {
@@ -2524,12 +3638,17 @@ fn main() -> Result<(), slint::PlatformError> {
                             break;
                         }
                         StreamEvent::Error(err_msg) => {
+                            finished = true;
                             let flushed_chunk = std::mem::take(&mut pending_delta);
                             let recs_lock = records_clone.clone();
                             let weak_app = app_weak_clone.clone();
                             let store_err = store_clone.clone();
+                            let gen_check = gen_coord_clone.clone();
 
                             let _ = slint::invoke_from_event_loop(move || {
+                                if !gen_check.is_current(my_gen_id) {
+                                    return;
+                                }
                                 if let Some(h) = weak_app.upgrade() {
                                     h.global::<AppState>().set_is_generating(false);
                                     {
@@ -2558,9 +3677,88 @@ fn main() -> Result<(), slint::PlatformError> {
                         }
                     }
                 }
+
+                // Safety net: if stream channel closed unexpectedly without Done/Error, still reset generating state
+                if !finished && gen_coord_clone.is_current(my_gen_id) {
+                    let flushed_chunk = std::mem::take(&mut pending_delta);
+                    let recs_lock = records_clone.clone();
+                    let weak_app = app_weak_clone.clone();
+                    let store_fallback = store_clone.clone();
+                    let gen_check = gen_coord_clone.clone();
+
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if !gen_check.is_current(my_gen_id) {
+                            return;
+                        }
+                        if let Some(h) = weak_app.upgrade() {
+                            h.global::<AppState>().set_is_generating(false);
+                            {
+                                let mut recs = recs_lock.write();
+                                if let Some(last) = recs.last_mut() {
+                                    if !flushed_chunk.is_empty() {
+                                        last.accumulated_content.push_str(&flushed_chunk);
+                                    }
+                                    last.is_streaming = false;
+                                    let _ = persist_assistant_record_if_needed(
+                                        &store_fallback,
+                                        turn_session_id,
+                                        last,
+                                    );
+                                }
+                                let is_dark = h.global::<Theme>().get_dark();
+                                sync_and_cull_ui(&h, &recs, is_dark);
+                            }
+                            refresh_session_list_ui(&h, &store_fallback);
+                            h.invoke_scroll_to_bottom_if_sticky();
+                        }
+                    });
+                }
             });
+            gen_coord.register_task(my_gen_id, outer_handle.abort_handle());
         }
     });
 
     app.run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generation_coordinator_invalidates_stale_turns_and_notifies_cancel() {
+        let coord = GenerationCoordinator::new();
+        let (gen1, rx1) = coord.begin_generation();
+        assert!(coord.is_current(gen1));
+        assert!(!*rx1.borrow());
+
+        let (gen2, rx2) = coord.begin_generation();
+        assert_ne!(gen1, gen2);
+        assert!(!coord.is_current(gen1));
+        assert!(coord.is_current(gen2));
+        assert!(*rx1.borrow());
+        assert!(!*rx2.borrow());
+
+        coord.cancel_active();
+        assert!(!coord.is_current(gen2));
+        assert!(*rx2.borrow());
+    }
+
+    #[test]
+    fn external_url_validation_allows_only_http_https_without_whitespace() {
+        assert!(is_safe_http_url("https://example.com/path?a=1&b=2"));
+        assert!(is_safe_http_url("http://localhost:8080"));
+        assert!(!is_safe_http_url("javascript:alert(1)"));
+        assert!(!is_safe_http_url("file:///C:/Windows/System32/cmd.exe"));
+        assert!(!is_safe_http_url("https://example.com/bad url"));
+    }
+
+    #[test]
+    fn toggle_task_checkbox_flips_target_item_only() {
+        let md = "- [ ] first\n- [x] second\n- [ ] third";
+        let toggled = toggle_task_checkbox_in_markdown(md, 1).expect("should toggle second");
+        assert_eq!(toggled, "- [ ] first\n- [ ] second\n- [ ] third");
+        let toggled2 = toggle_task_checkbox_in_markdown(&toggled, 2).expect("should toggle third");
+        assert_eq!(toggled2, "- [ ] first\n- [ ] second\n- [x] third");
+    }
 }
