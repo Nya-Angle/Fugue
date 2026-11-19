@@ -184,6 +184,18 @@ impl FenwickViewportIndex {
         self.heights.get(index).copied().map(Self::to_px).unwrap_or(0.0)
     }
 
+    /// Find the item index containing `y_px` (clamped to `[0, len - 1]`) and its top Y offset in $O(\log N)$ time.
+    /// Returns `None` only when the index is empty.
+    pub fn find_index_at_y(&self, y_px: f32) -> Option<(usize, f32)> {
+        let n = self.heights.len();
+        if n == 0 {
+            return None;
+        }
+        let target_units = Self::to_units(y_px.max(0.0));
+        let idx = self.lower_bound_item(target_units).min(n - 1);
+        Some((idx, self.offset_of(idx)))
+    }
+
     /// Binary lifting on the Fenwick tree in $O(\log N)$ time.
     /// Returns the smallest 0-based item index `i` such that `prefix_units(i + 1) > target_units`.
     /// If `target_units >= total_units`, returns `self.heights.len()`.
@@ -302,5 +314,18 @@ mod tests {
         index.update_height(1, 160.0);
         assert_eq!(index.offset_of(2), 200.0);
         assert_eq!(index.total_height(), 380.0);
+    }
+
+    #[test]
+    fn test_find_index_at_y() {
+        let mut index = FenwickViewportIndex::new();
+        assert_eq!(index.find_index_at_y(10.0), None);
+        index.sync_heights(&[40.0, 60.0, 80.0]);
+        assert_eq!(index.find_index_at_y(-5.0), Some((0, 0.0)));
+        assert_eq!(index.find_index_at_y(39.5), Some((0, 0.0)));
+        assert_eq!(index.find_index_at_y(40.0), Some((1, 40.0)));
+        assert_eq!(index.find_index_at_y(99.0), Some((1, 40.0)));
+        assert_eq!(index.find_index_at_y(100.0), Some((2, 100.0)));
+        assert_eq!(index.find_index_at_y(500.0), Some((2, 100.0)));
     }
 }
